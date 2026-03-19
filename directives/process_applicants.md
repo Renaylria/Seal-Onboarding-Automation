@@ -27,13 +27,22 @@ python execution/process_applicants.py
    - Column N does not match any keyword (including blank) → **Approved**
 6. **Append** approved rows to "Approved" tab; rejected rows to "Rejected" tab
 7. **Create tabs** if they don't exist yet (copies header from Current Applicants)
-8. **Ensure 10 empty rows** at the bottom of both Approved and Rejected tabs
-9. **For each approved row:**
-   - Add email (column B) to Google Group via Admin SDK
-   - Send approval email via Gmail API (`email.subject` / `email.body` from config)
-10. **For each rejected row:**
-    - Send rejection email via Gmail API (`rejection_email.subject` / `rejection_email.body` from config)
-11. **Log** all actions to `.tmp/process_applicants.log`
+8. **Ensure column O header** ("Email Sent") is set in both Approved and Rejected tabs
+9. **For each approved row:** add email to Google Group via Admin SDK
+10. **Scan Approved tab** for rows where column O is blank → send approval email → write timestamp to column O
+11. **Scan Rejected tab** for rows where column O is blank → send rejection email → write timestamp to column O
+12. **Ensure 10 empty rows** at the bottom of both tabs
+13. **Log** all actions to `.tmp/process_applicants.log`
+
+### Column O — "Email Sent" tracker
+Column O acts as the authoritative record of whether an email has been sent for each row.
+
+- **Blank** = email not yet sent → script will send it and write a timestamp (e.g. `Sent 2026-03-18 18:05`)
+- **Populated** = email already sent → row is skipped every run
+
+This design is **self-healing**: if a send fails, column O stays blank and the script retries automatically on the next hourly run. It also **backfills** any historical rows in Approved or Rejected that pre-date the email feature — they will receive emails on the next run after this code is deployed.
+
+> ⚠️ **First production run note**: Any existing rows in the Approved or Rejected tabs with a blank column O will trigger emails. Keep `testing.test_email_override` set until you have manually pre-populated column O for historical rows you do *not* want emailed.
 
 ### Test override
 When `testing.test_email_override` in `config.yaml` is set to a non-empty email address,
@@ -48,6 +57,7 @@ logged alongside the override address. Set to `""` to send to real recipients.
 | B | 1 | Email address |
 | C | 2 | Applicant name (default — adjust `name_column_index` in config) |
 | N | 13 | Status / approval decision |
+| O | 14 | Email Sent — written by script after successful send (`Sent YYYY-MM-DD HH:MM`) |
 
 ## Deduplication Strategy
 A row is skipped if its email (column B) already appears in either the "Approved" or "Rejected" tab. This means:
@@ -85,3 +95,5 @@ To run manually at any time: `python execution/process_applicants.py`
 - **Duplicate emails in source sheet**: Same email can appear multiple times in Current Applicants — script deduplicates within each run, processing only the first occurrence
 - **"Previously Departed" status**: Old relic of past SEAL processes, will not appear in future — treated as Approved (no rejection keyword match), which is correct
 - **Test email override**: `testing.test_email_override` in `config.yaml` redirects all outgoing emails to the specified address. Set to `""` to go live. Both approval and rejection emails respect this setting.
+- **Column O backfill**: On the first run after deploying column O tracking, all existing rows in Approved/Rejected with blank column O will trigger emails. Keep the test override set and pre-populate historical rows' column O (any non-blank value) before going live.
+- **Failed send retry**: If the Gmail API call fails, column O stays blank and the row is retried automatically on the next run. No manual intervention needed.

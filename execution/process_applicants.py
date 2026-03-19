@@ -18,6 +18,7 @@ import re
 import sys
 import logging
 import base64
+from datetime import datetime
 from pathlib import Path
 from email.message import EmailMessage
 
@@ -182,7 +183,7 @@ def add_to_google_group(admin_svc, group_email: str, member_email: str, log):
 
 def send_email(gmail_svc, sender: str, recipient: str, name: str,
                subject: str, body_template: str, log,
-               test_override: str = ""):
+               test_override: str = "") -> bool:
     """Send an email via Gmail API using the configured template.
 
     Args:
@@ -196,6 +197,10 @@ def send_email(gmail_svc, sender: str, recipient: str, name: str,
         test_override:  When non-empty, redirects the email to this address
                         instead of the real recipient (for testing). Set via
                         testing.test_email_override in config.yaml.
+
+    Returns:
+        True if the email was sent successfully, False otherwise.
+        The caller should only mark column O as sent when True is returned.
     """
     actual_to = test_override if test_override else recipient
     try:
@@ -208,11 +213,114 @@ def send_email(gmail_svc, sender: str, recipient: str, name: str,
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         gmail_svc.users().messages().send(userId="me", body={"raw": raw}).execute()
         if test_override:
-            log.info(f"  [Email] Sent to: {actual_to} (test override — real recipient: {recipient})")
+            log.info(f"  [Email] Sent to: {actual_to} (test override - real recipient: {recipient})")
         else:
             log.info(f"  [Email] Sent to: {actual_to}")
+        return True
     except Exception as e:
         log.error(f"  [Email] Failed for {actual_to}: {e}")
+        return False
+
+
+def get_rows_needing_email(svc, spreadsheet_id: str, tab: str,
+                           email_col: int, name_col: int,
+                           email_sent_col: int) -> list:
+    """Return rows in a tab that have not yet had an email sent.
+
+    Scans every data row (skipping the header) and returns those where
+    the email_sent column (column O) is blank or missing.  This covers
+    both rows just appended this run and any historical rows that were
+    added before the email feature existed.
+
+    Args:
+        svc:            Authenticated Sheets API client.
+        spreadsheet_id: Google Sheet ID.
+        tab:            Tab name to scan (e.g. "Approved" or "Rejected").
+        email_col:      0-based column index for email address.
+        name_col:       0-based column index for recipient name.
+        email_sent_col: 0-based column index for the "Email Sent" marker (column O).
+
+    Returns:
+        List of (row_number_1indexed, email, name) tuples — one per unsent row.
+    """
+    try:
+        data = get_sheet_data(svc, spreadsheet_id, tab)
+    except HttpError:
+        return []
+
+    result = []
+    for i, row in enumerate(data):
+        if i == 0:
+            continue  # skip header row
+        row_number = i + 1  # 1-indexed for Sheets API
+        if len(row) <= email_col or not row[email_col].strip():
+            continue
+        email = row[email_col].strip()
+        if not EMAIL_RE.match(email):
+            continue
+        # Only include rows where the sent marker is blank or absent
+        sent = row[email_sent_col].strip() if len(row) > email_sent_col else ""
+        if sent:
+            continue
+        name = row[name_col].strip() if len(row) > name_col else ""
+        result.append((row_number, email, name))
+    return result
+
+
+def mark_email_sent(svc, spreadsheet_id: str, tab: str,
+                    row_number: int, email_sent_col: int, log):
+    """Write a sent timestamp to column O of a specific data row.
+
+    Args:
+        svc:            Authenticated Sheets API client.
+        spreadsheet_id: Google Sheet ID.
+        tab:            Tab name (e.g. "Approved").
+        row_number:     1-indexed row number in the sheet.
+        email_sent_col: 0-based column index to write into (column O = 14).
+        log:            Logger instance.
+    """
+    col_letter = chr(ord('A') + email_sent_col)   # 14 -> 'O'
+    cell = f"'{tab}'!{col_letter}{row_number}"
+    timestamp = datetime.now().strftime("Sent %Y-%m-%d %H:%M")
+    try:
+        svc.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=cell,
+            valueInputOption="USER_ENTERED",
+            body={"values": [[timestamp]]}
+        ).execute()
+    except Exception as e:
+        log.error(f"  [Sheets] Failed to mark email sent at {cell}: {e}")
+
+
+def ensure_column_header(svc, spreadsheet_id: str, tab: str,
+                         col_idx: int, header_text: str, log):
+    """Write a header label to the specified column in row 1 if it is blank.
+
+    Args:
+        svc:            Authenticated Sheets API client.
+        spreadsheet_id: Google Sheet ID.
+        tab:            Tab name.
+        col_idx:        0-based column index (e.g. 14 for column O).
+        header_text:    Label to write (e.g. "Email Sent").
+        log:            Logger instance.
+    """
+    try:
+        data = get_sheet_data(svc, spreadsheet_id, tab)
+    except HttpError:
+        return
+    header_row = data[0] if data else []
+    current = header_row[col_idx].strip() if len(header_row) > col_idx else ""
+    if not current:
+        col_letter = chr(ord('A') + col_idx)
+        cell = f"'{tab}'!{col_letter}1"
+        svc.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=cell,
+            valueInputOption="USER_ENTERED",
+            body={"values": [[header_text]]}
+        ).execute()
+        log.info(f"  [Sheets] Set column {col_letter} header in '{tab}' to '{header_text}'")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -237,20 +345,21 @@ def main():
     with open(CONFIG, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    s              = cfg["sheets"]
-    sid            = s["spreadsheet_id"]
-    current_tab    = s["current_applicants_tab"]
-    approved_tab   = s["approved_tab"]
-    rejected_tab   = s["rejected_tab"]
-    email_col      = s["email_column_index"]
-    status_col     = s["status_column_index"]
-    name_col       = s["name_column_index"]
-    min_empty      = s["min_empty_rows"]
-    keywords       = cfg["rejection_keywords"]
-    group_email    = cfg["google_group"]["email"]
-    email_cfg      = cfg["email"]
+    s                = cfg["sheets"]
+    sid              = s["spreadsheet_id"]
+    current_tab      = s["current_applicants_tab"]
+    approved_tab     = s["approved_tab"]
+    rejected_tab     = s["rejected_tab"]
+    email_col        = s["email_column_index"]
+    status_col       = s["status_column_index"]
+    name_col         = s["name_column_index"]
+    email_sent_col   = s["email_sent_column_index"]
+    min_empty        = s["min_empty_rows"]
+    keywords         = cfg["rejection_keywords"]
+    group_email      = cfg["google_group"]["email"]
+    email_cfg        = cfg["email"]
     rejection_email_cfg = cfg["rejection_email"]
-    test_override  = cfg.get("testing", {}).get("test_email_override", "").strip()
+    test_override    = cfg.get("testing", {}).get("test_email_override", "").strip()
 
     if test_override:
         log.info(f"TEST MODE: all outgoing emails will be sent to {test_override}")
@@ -282,6 +391,10 @@ def main():
     # Ensure destination tabs exist (creates them with header if missing)
     ensure_tab_exists(sheets_svc, sid, approved_tab, header)
     ensure_tab_exists(sheets_svc, sid, rejected_tab, header)
+
+    # Ensure column O is labelled in both tabs
+    for tab in [approved_tab, rejected_tab]:
+        ensure_column_header(sheets_svc, sid, tab, email_sent_col, "Email Sent", log)
 
     # Classify new rows
     new_approved = []   # list of (row, email, name)
@@ -317,22 +430,38 @@ def main():
 
     log.info(f"New this run -> approved: {len(new_approved)}, rejected: {len(new_rejected)}")
 
-    # ── Write approved rows + side effects ────────────────────────────────────
+    # ── Write new rows to destination tabs ────────────────────────────────────
     if new_approved:
         append_rows(sheets_svc, sid, approved_tab, [r for r, _, _ in new_approved])
+        log.info(f"  [Sheets] Appended {len(new_approved)} row(s) to '{approved_tab}'")
         for _, email, name in new_approved:
             add_to_google_group(admin_svc, group_email, email, log)
-            send_email(gmail_svc, email_cfg["sender"], email, name,
-                       email_cfg["subject"], email_cfg["body"], log,
-                       test_override=test_override)
 
-    # ── Write rejected rows + send rejection email ─────────────────────────────
     if new_rejected:
         append_rows(sheets_svc, sid, rejected_tab, [r for r, _, _ in new_rejected])
-        for _, email, name in new_rejected:
-            send_email(gmail_svc, email_cfg["sender"], email, name,
-                       rejection_email_cfg["subject"], rejection_email_cfg["body"], log,
-                       test_override=test_override)
+        log.info(f"  [Sheets] Appended {len(new_rejected)} row(s) to '{rejected_tab}'")
+
+    # ── Send emails: scan both tabs for rows with blank column O ───────────────
+    # This handles both rows just appended this run AND any historical rows that
+    # were added before the email feature existed (self-healing backfill).
+    # Column O is only written after a successful send, so a failed send is
+    # automatically retried on the next run.
+    for tab, subject, body in [
+        (approved_tab,  email_cfg["subject"],            email_cfg["body"]),
+        (rejected_tab,  rejection_email_cfg["subject"],  rejection_email_cfg["body"]),
+    ]:
+        pending = get_rows_needing_email(
+            sheets_svc, sid, tab, email_col, name_col, email_sent_col
+        )
+        if pending:
+            log.info(f"  [Email] {len(pending)} unsent row(s) found in '{tab}'")
+        for row_number, email, name in pending:
+            sent = send_email(
+                gmail_svc, email_cfg["sender"], email, name,
+                subject, body, log, test_override=test_override
+            )
+            if sent:
+                mark_email_sent(sheets_svc, sid, tab, row_number, email_sent_col, log)
 
     # ── Maintain 10 empty rows in both tabs ────────────────────────────────────
     for tab in [approved_tab, rejected_tab]:

@@ -12,10 +12,11 @@ sheets:
   approved_tab: "Approved"
   rejected_tab: "Rejected"
 
-  # Column indices are 0-based (A=0, B=1, C=2, ..., N=13)
+  # Column indices are 0-based (A=0, B=1, C=2, ..., N=13, O=14)
   email_column_index: 1       # Column B — applicant email address
   status_column_index: 13     # Column N — approval status set by reviewer
   name_column_index: 3        # Column D — applicant name (used in email greeting)
+  email_sent_column_index: 14 # Column O — timestamp written after email is sent ("Sent YYYY-MM-DD HH:MM")
   min_empty_rows: 10          # Minimum empty rows to keep at the bottom of Approved/Rejected tabs
 
 
@@ -42,7 +43,7 @@ google_group:
 # Available placeholders in body: {name}, {email}
 email:
   sender: "admin@maxalton.com"
-  subject: "Welcome to SEAL — Your Application Has Been Approved"
+  subject: "Regarding Your Application to the Sensors, Energy, and Automation Laboratory"
   body: |
     Hi {name},
 
@@ -66,17 +67,17 @@ email:
 # Sent to every newly rejected applicant.
 # Available placeholders in body: {name}, {email}
 rejection_email:
-  subject: "Your SEAL Application"
+  subject: "Regarding Your Application to the Sensors, Energy, and Automation Laboratory"
   body: |
     Hi {name},
 
-    Thank you for taking the time to apply to SEAL. After careful review,
-    we are unable to approve your application at this time.
+    Thank you for your application to the Sensors, Energy, and Automation Laboratory (SEAL). We truly appreciate the time and effort that you have invested in this process. After careful consideration, we regret to inform you that we are unable to extend an offer to you at this time. These positions are limited and highly competitive.
 
-    We appreciate your interest and encourage you to keep developing your skills.
+    We genuinely appreciate your interest in our lab, and we wish you the best of luck in your search and your future academic and career endeavors.
 
-    Best,
-    The SEAL Team
+    Best regards,
+    The SEAL Team 
+
 
 
 # ── Testing ────────────────────────────────────────────────────────────────────
