@@ -26,11 +26,11 @@ This keeps Associates clean and removes access for members who are no longer act
 
 The script performs a **case-insensitive `startswith` match** on the column K value.
 
-| Status trigger | Destination sheet | Destination tab | Remove from group? |
-|---|---|---|---|
-| `gameover` | Clan Life AAD (`aad_sheet_id`) | Ex-Communicado | Yes |
-| `ex-associate` | Clan Life AAD (`aad_sheet_id`) | Ex-Associate | Yes |
-| `affiliate` | SEAL Clan Life (`clan_life_sheet_id`) | Affiliates | No |
+| Status trigger | Destination sheet | Destination tab | Remove from group? | Deactivate Slack? |
+|---|---|---|---|---|
+| `gameover` | Clan Life AAD (`aad_sheet_id`) | Ex-Communicado | Yes | Yes |
+| `ex-associate` | Clan Life AAD (`aad_sheet_id`) | Ex-Associate | Yes | Yes |
+| `affiliate` | SEAL Clan Life (`clan_life_sheet_id`) | Affiliates | No | No |
 
 Rows with a blank or unrecognised status value in column K are ignored.
 
@@ -44,6 +44,47 @@ Rows with a blank or unrecognised status value in column K are ignored.
 - A 404 response (member not in the group) is logged as info and skipped —
   it is not treated as an error.
 - If the email cell is blank, group removal is skipped with a warning.
+
+---
+
+## Slack Deactivation
+
+Applies only to **GameOver** and **Ex-Associate** rows, immediately after group removal.
+
+### Decision tree (`handle_slack_deactivate`)
+
+| Condition | Action |
+|---|---|
+| `SLACK_USER_TOKEN` not set | Skip with warning |
+| Email not found in workspace | Log info — nothing to deactivate |
+| Account already deactivated | Log info — no action needed |
+| Account active | Deactivate (API → Playwright fallback) |
+
+### API path (`slack_deactivate_api`)
+
+Tries `users.admin.setInactive`.  This endpoint requires the legacy `client` scope
+which is not available on modern Slack apps (returns `missing_scope` / `needed: client`).
+Expected to fail; Playwright is the working path.
+
+### Playwright path (`slack_deactivate_playwright`)
+
+Confirmed working flow:
+1. Login at `sealuw.slack.com/sign_in_with_password`
+2. Load workspace SPA to establish the full session
+3. Click Admin sidebar → Manage members (opens popup at `sealuw.slack.com/admin`)
+4. Search for target email — **no Inactive filter** (user is active)
+5. Click `data-qa="table_row_actions_button"` (the `...` row action button)
+6. Click **"Deactivate account"** from the dropdown
+7. Click the confirm button in the deactivation modal
+   — button is labelled **"Deactivate"** (contrast with reactivation which uses **"Save"**)
+
+### Test script
+
+```
+python execution/test_slack_deactivate.py active@example.com
+```
+
+Screenshots written to `.tmp/deactivate_*.png` for debugging.
 
 ---
 
@@ -74,11 +115,14 @@ row order so that earlier indices remain valid as rows are removed.
 | Scenario | Behaviour |
 |---|---|
 | Row is protected in Associates | `delete_rows` catches the 403 HttpError, logs a warning, and continues. The row remains in Associates. |
-| Email cell (col AP) is blank | Group removal step is skipped; the row is still written to the destination and deleted from Associates. |
+| Email cell (col AP) is blank | Group removal and Slack deactivation are skipped; the row is still written to the destination and deleted from Associates. |
 | Destination tab missing | Created automatically before any writes. |
 | Member not in Google Group (404) | Logged as info; not treated as an error. |
 | Row too short to have a status value | Skipped silently. |
 | No rows match any trigger | Script exits cleanly after logging "No rows to delete." |
+| Slack user not found | Logged as info — member never had a Slack account; no action taken. |
+| Slack account already deactivated | Logged as info — idempotent; no action taken. |
+| `SLACK_USER_TOKEN` not set | Slack step skipped with a warning; all other steps proceed normally. |
 
 ---
 
@@ -124,9 +168,14 @@ inside `process_clan_cleanup.py` (the `status.startswith(...)` calls in `main`).
 
 ## Learnings / Known Constraints
 
-_(Append new findings here as they are discovered.)_
-
 - The Sheets API omits trailing empty cells within a row.  All column index
   accesses use `len(row) > col_index` guards to prevent IndexError on short rows.
 - Protected rows in Associates (e.g. pinned header rows) will raise a 403 on
   deletion.  These are caught and logged; the rest of the batch continues.
+- `users.admin.setInactive` (Slack deactivation API) requires the legacy `client`
+  scope — not available on modern Slack apps.  Playwright is the working path.
+- The deactivation confirmation modal button is **"Deactivate"** (not "Save", "Confirm",
+  or "Yes").  Contrast with the reactivation modal in process_challenge.py which uses
+  **"Save"**.
+- No Inactive filter is needed when searching for a member to deactivate — they are
+  still active at that point.  The filter is only needed for reactivation.

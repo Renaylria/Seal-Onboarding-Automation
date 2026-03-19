@@ -18,15 +18,22 @@ Run:
 from __future__ import annotations
 
 import logging
+import os
+import re
 import sys
 from pathlib import Path
 
+import requests as http_requests
 import yaml
+from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from playwright.sync_api import sync_playwright
+
+load_dotenv()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT        = Path(__file__).resolve().parent.parent
@@ -40,6 +47,13 @@ LOG_FILE    = TMP / "process_clan_cleanup.log"
 # ── OAuth Scopes ───────────────────────────────────────────────────────────────
 SCOPES_GMAIL = ["https://www.googleapis.com/auth/spreadsheets"]
 SCOPES_ADMIN = ["https://www.googleapis.com/auth/admin.directory.group.member"]
+
+# ── Slack credentials (from .env) ──────────────────────────────────────────────
+SLACK_USER_TOKEN     = os.getenv("SLACK_USER_TOKEN", "").strip()
+SLACK_ADMIN_EMAIL    = os.getenv("SLACK_ADMIN_EMAIL", "").strip()
+SLACK_ADMIN_PASSWORD = os.getenv("SLACK_ADMIN_PASSWORD", "").strip()
+SLACK_WORKSPACE      = "sealuw.slack.com"
+EMAIL_RE             = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,6 +335,336 @@ def remove_from_google_group(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Slack
+# ══════════════════════════════════════════════════════════════════════════════
+
+def slack_lookup_user(email: str, log: logging.Logger) -> tuple[str | None, bool]:
+    """Look up a Slack user by email.
+
+    First tries users.lookupByEmail (fast path, active users only).
+    If not found, paginates users.list which includes deactivated accounts.
+
+    Args:
+        email: The email address to search for.
+        log:   Logger instance.
+
+    Returns:
+        (user_id, is_deactivated) if found, or (None, False) if not found
+        or if SLACK_USER_TOKEN is not configured.
+    """
+    if not SLACK_USER_TOKEN:
+        return None, False
+
+    # Fast path — active users only
+    resp = http_requests.get(
+        "https://slack.com/api/users.lookupByEmail",
+        params={"email": email},
+        headers={"Authorization": f"Bearer {SLACK_USER_TOKEN}"},
+        timeout=10,
+    )
+    data = resp.json()
+    if data.get("ok"):
+        user = data["user"]
+        return user["id"], user.get("deleted", False)
+    if data.get("error") != "users_not_found":
+        log.error("  [Slack] Lookup error for %s: %s", email, data.get("error"))
+        return None, False
+
+    # Fallback — paginate to find deactivated accounts
+    log.info(
+        "  [Slack] %s not found via lookupByEmail — scanning full user list", email
+    )
+    target = email.strip().lower()
+    cursor = None
+    while True:
+        params: dict = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        resp = http_requests.get(
+            "https://slack.com/api/users.list",
+            params=params,
+            headers={"Authorization": f"Bearer {SLACK_USER_TOKEN}"},
+            timeout=15,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            log.error("  [Slack] users.list error: %s", data.get("error"))
+            return None, False
+        for member in data.get("members", []):
+            profile = member.get("profile", {})
+            member_email = profile.get("email", "").strip().lower()
+            if member_email == target:
+                return member["id"], member.get("deleted", False)
+        cursor = data.get("response_metadata", {}).get("next_cursor", "")
+        if not cursor:
+            break
+
+    return None, False
+
+
+def slack_deactivate_api(user_id: str, log: logging.Logger) -> bool:
+    """Attempt to deactivate a Slack user via the unofficial users.admin.setInactive
+    endpoint.  Mirrors slack_reactivate_api from process_challenge.py.
+
+    This endpoint requires the legacy 'client' scope which is unavailable on modern
+    Slack apps (returns missing_scope / needed: client).  Returns False so the caller
+    falls back to Playwright.
+
+    Args:
+        user_id: The Slack user ID (e.g. "U012AB3CD").
+        log:     Logger instance.
+
+    Returns:
+        True if deactivation succeeded, False otherwise.
+    """
+    resp = http_requests.post(
+        "https://slack.com/api/users.admin.setInactive",
+        data={"token": SLACK_USER_TOKEN, "user": user_id},
+        timeout=10,
+    )
+    data = resp.json()
+    if data.get("ok"):
+        log.info("  [Slack] Deactivated via API: %s", user_id)
+        return True
+    log.warning(
+        "  [Slack] API deactivation unavailable (%s) — falling back to Playwright",
+        data.get("error"),
+    )
+    return False
+
+
+def slack_deactivate_playwright(email: str, log: logging.Logger) -> bool:
+    """Deactivate an active Slack member via the admin panel GUI.
+
+    Mirrors slack_reactivate_playwright from process_challenge.py but for removal:
+      1. Login at sealuw.slack.com/sign_in_with_password
+      2. Load workspace SPA to establish the full session
+      3. Click Admin sidebar → Manage members (opens popup at sealuw.slack.com/admin)
+      4. Search for target email (no Inactive filter — user is active)
+      5. Click data-qa="table_row_actions_button" (the '...' row action button)
+      6. Click 'Deactivate account' from the dropdown
+      7. Click the confirm button in the deactivation modal
+         (labelled "Deactivate" — NOT "Save" like in the reactivation modal)
+
+    Args:
+        email: The email address of the Slack member to deactivate.
+        log:   Logger instance.
+
+    Returns:
+        True if deactivation succeeded, False otherwise.
+    """
+    if not SLACK_ADMIN_EMAIL or not SLACK_ADMIN_PASSWORD:
+        log.error(
+            "  [Slack] SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD not set "
+            "— cannot deactivate via Playwright"
+        )
+        return False
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+
+            # ── Sign in ───────────────────────────────────────────────────────
+            page.goto(f"https://{SLACK_WORKSPACE}/sign_in_with_password")
+            page.wait_for_load_state("networkidle")
+            page.fill('input[data-qa="login_email"]', SLACK_ADMIN_EMAIL)
+            page.click('input[type="password"]')
+            page.keyboard.type(SLACK_ADMIN_PASSWORD, delay=50)
+
+            sign_in_btn = (
+                page.query_selector('button[data-qa="signin_button"]')
+                or page.query_selector('button[type="submit"]')
+            )
+            sign_in_btn.click()
+            page.wait_for_load_state("networkidle", timeout=30_000)
+            page.wait_for_timeout(4000)
+
+            if "sign_in" in page.url:
+                log.error(
+                    "  [Slack] Playwright login failed — check "
+                    "SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD in .env"
+                )
+                page.screenshot(path=str(TMP / "slack_deactivate_login_failed.png"))
+                browser.close()
+                return False
+
+            # ── Load workspace SPA ────────────────────────────────────────────
+            page.goto(f"https://{SLACK_WORKSPACE}/", wait_until="load", timeout=30_000)
+            page.wait_for_timeout(10_000)
+
+            # ── Open Manage members via Admin sidebar ─────────────────────────
+            for btn in page.query_selector_all("button"):
+                if btn.inner_text().strip() == "Admin":
+                    btn.click()
+                    break
+            page.wait_for_timeout(2000)
+
+            manage_link = None
+            for el in page.query_selector_all("a"):
+                if "Manage members" in el.inner_text().strip():
+                    manage_link = el
+                    break
+
+            if not manage_link:
+                log.error("  [Slack] Playwright could not find Manage members link")
+                page.screenshot(
+                    path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
+                )
+                browser.close()
+                return False
+
+            admin_href = (
+                manage_link.get_attribute("href") or f"https://{SLACK_WORKSPACE}/admin"
+            )
+            try:
+                from playwright.sync_api import TimeoutError as PWTimeout
+                with context.expect_page(timeout=6000) as popup_info:
+                    manage_link.click()
+                admin_page = popup_info.value
+                admin_page.wait_for_load_state("load", timeout=30_000)
+                admin_page.wait_for_timeout(8000)
+            except Exception:
+                admin_page = page
+                page.goto(admin_href, wait_until="load", timeout=30_000)
+                page.wait_for_timeout(8000)
+
+            # ── Search for the target email (no Inactive filter needed) ───────
+            search = admin_page.query_selector(
+                'input[data-qa="workspace-members__table-header-search_input"], '
+                'input[placeholder*="ilter by name"], input[type="search"]'
+            )
+            if not search:
+                log.error(
+                    "  [Slack] Playwright could not find search input for %s", email
+                )
+                admin_page.screenshot(
+                    path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
+                )
+                browser.close()
+                return False
+
+            search.fill(email)
+            admin_page.wait_for_timeout(5000)
+
+            # ── Click the '...' row action button ────────────────────────────
+            action_btn = (
+                admin_page.query_selector('[data-qa="table_row_actions_button"]')
+                or admin_page.query_selector('[aria-label*="Actions for"]')
+            )
+            if not action_btn:
+                log.error(
+                    "  [Slack] Playwright could not find row action button for %s", email
+                )
+                admin_page.screenshot(
+                    path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
+                )
+                browser.close()
+                return False
+
+            action_btn.click()
+            admin_page.wait_for_timeout(2000)
+
+            # ── Click 'Deactivate account' from the dropdown ──────────────────
+            deactivate_btn = admin_page.query_selector(
+                '[data-qa="deactivate_member_button"]'
+            )
+            if not deactivate_btn:
+                for el in admin_page.query_selector_all(
+                    "button, [role='menuitem'], li"
+                ):
+                    txt = el.inner_text().strip().lower()
+                    if "deactivate account" in txt or txt == "deactivate":
+                        deactivate_btn = el
+                        break
+
+            if not deactivate_btn:
+                log.error(
+                    "  [Slack] Playwright could not find Deactivate button for %s", email
+                )
+                admin_page.screenshot(
+                    path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
+                )
+                browser.close()
+                return False
+
+            deactivate_btn.click()
+            admin_page.wait_for_timeout(2000)
+
+            # ── Handle confirmation modal ─────────────────────────────────────
+            # Slack shows a confirmation dialog.
+            # The confirm button is labelled "Deactivate" — NOT "Save" like
+            # in the reactivation modal.
+            confirm_btn = (
+                admin_page.query_selector('[data-qa="deactivate_confirm_button"]')
+                or admin_page.query_selector('[data-qa="confirm_button"]')
+            )
+            if not confirm_btn:
+                for btn in admin_page.query_selector_all("button"):
+                    txt = btn.inner_text().strip().lower()
+                    if txt in ("deactivate", "deactivate account", "confirm",
+                               "yes", "remove"):
+                        confirm_btn = btn
+                        break
+
+            if not confirm_btn:
+                log.error(
+                    "  [Slack] Playwright could not find confirmation button "
+                    "in deactivation modal for %s",
+                    email,
+                )
+                admin_page.screenshot(
+                    path=str(TMP / f"slack_deactivate_no_confirm_{email.split('@')[0]}.png")
+                )
+                browser.close()
+                return False
+
+            confirm_btn.click()
+            admin_page.wait_for_timeout(2000)
+
+            log.info("  [Slack] Deactivated via Playwright: %s", email)
+            browser.close()
+            return True
+
+    except Exception as exc:
+        log.error("  [Slack] Playwright deactivation failed for %s: %s", email, exc)
+        return False
+
+
+def handle_slack_deactivate(email: str, log: logging.Logger) -> None:
+    """Deactivate a Slack member. Skips if already deactivated or not found.
+
+    Decision tree:
+      - Token not set              → skip with warning
+      - User not found in Slack    → log info, nothing to do
+      - Account already deactivated → log info, nothing to do
+      - Account active             → deactivate (API first, then Playwright fallback)
+
+    Args:
+        email: The email address of the member to deactivate.
+        log:   Logger instance.
+    """
+    if not SLACK_USER_TOKEN:
+        log.warning("  [Slack] SLACK_USER_TOKEN not set — skipping Slack deactivation")
+        return
+
+    user_id, is_deactivated = slack_lookup_user(email, log)
+
+    if user_id is None:
+        log.info("  [Slack] %s not found in workspace — no deactivation needed", email)
+        return
+
+    if is_deactivated:
+        log.info("  [Slack] %s is already deactivated — no action needed", email)
+        return
+
+    # User is active — deactivate
+    log.info("  [Slack] Deactivating active account for %s", email)
+    if not slack_deactivate_api(user_id, log):
+        slack_deactivate_playwright(email, log)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main orchestration
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -416,9 +760,10 @@ def main() -> None:
             member_email = row[email_col].strip() if len(row) > email_col else ""
             if member_email:
                 remove_from_google_group(admin_svc, active_group_email, member_email, log)
+                handle_slack_deactivate(member_email, log)
             else:
                 log.warning(
-                    "  Row %d has no email in column AP — skipping group removal",
+                    "  Row %d has no email in column AP — skipping group removal and Slack deactivation",
                     list_idx + 1,
                 )
             rows_to_delete.append(list_idx)
@@ -438,9 +783,10 @@ def main() -> None:
             member_email = row[email_col].strip() if len(row) > email_col else ""
             if member_email:
                 remove_from_google_group(admin_svc, active_group_email, member_email, log)
+                handle_slack_deactivate(member_email, log)
             else:
                 log.warning(
-                    "  Row %d has no email in column AP — skipping group removal",
+                    "  Row %d has no email in column AP — skipping group removal and Slack deactivation",
                     list_idx + 1,
                 )
             rows_to_delete.append(list_idx)
