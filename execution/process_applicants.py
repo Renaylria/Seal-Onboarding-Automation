@@ -39,6 +39,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google_auth_httplib2 import AuthorizedHttp
+from proxy_http import make_http
+from tui_status import set_live, log_run_start, log_run_msg, log_event, log_result
+from run_logger import RunLogger
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).resolve().parent.parent
@@ -149,6 +153,21 @@ def write_to_next_blank_row(svc, spreadsheet_id: str, tab: str, rows: list,
         body={"values": rows}
     ).execute()
     log.info(f"  [Sheets] Wrote {len(rows)} row(s) to '{tab}' starting at row {next_row}")
+
+    # ── Verify write ──────────────────────────────────────────────────────
+    verify = svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{tab}'!A{next_row}:A{next_row + len(rows) - 1}"
+    ).execute()
+    written = verify.get("values", [])
+    if len(written) != len(rows):
+        log.error(
+            f"  [Sheets] VERIFY FAILED: expected {len(rows)} row(s) at '{tab}'!A{next_row}, "
+            f"but read back {len(written)}. Data may not have been written correctly."
+        )
+    else:
+        log.info(f"  [Sheets] Verified {len(written)} row(s) written to '{tab}'")
+
     return next_row
 
 
@@ -324,20 +343,43 @@ def batch_mark_emails_sent(svc, spreadsheet_id: str,
             body={"valueInputOption": "USER_ENTERED", "data": data}
         ).execute()
         log.info(f"  [Sheets] Marked {len(marks)} row(s) as email sent in column {col_letter}")
+
+        # ── Verify marks were written ─────────────────────────────────────
+        failed_verifications = []
+        for tab, row_number in marks:
+            cell = f"'{tab}'!{col_letter}{row_number}"
+            verify = svc.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=cell
+            ).execute()
+            val = verify.get("values", [[""]])[0][0] if verify.get("values") else ""
+            if not val.startswith("Sent"):
+                failed_verifications.append(cell)
+        if failed_verifications:
+            log.error(
+                f"  [Sheets] VERIFY FAILED: {len(failed_verifications)} email-sent "
+                f"mark(s) not written: {failed_verifications}"
+            )
+        else:
+            log.info(f"  [Sheets] Verified all {len(marks)} email-sent mark(s)")
     except Exception as e:
         log.error(f"  [Sheets] Failed to batch-mark email sent: {e}")
 
 
-def ensure_column_header(svc, spreadsheet_id: str, tab: str,
+def verify_column_header(svc, spreadsheet_id: str, tab: str,
                          col_idx: int, header_text: str, log):
-    """Write a header label to the specified column in row 1 if it is blank.
+    """Verify that the expected header label exists at the specified column in row 1.
+
+    Does NOT create or write columns — only checks and warns if the header is
+    missing or unexpected.  If the header is absent, the column O email-sent
+    tracking will still work (blank cells are treated as unsent), but the log
+    warning alerts operators to manually add the header.
 
     Args:
         svc:            Authenticated Sheets API client.
         spreadsheet_id: Google Sheet ID.
         tab:            Tab name.
         col_idx:        0-based column index (e.g. 14 for column O).
-        header_text:    Label to write (e.g. "Email Sent").
+        header_text:    Expected label (e.g. "Email Sent").
         log:            Logger instance.
     """
     try:
@@ -348,14 +390,10 @@ def ensure_column_header(svc, spreadsheet_id: str, tab: str,
     current = header_row[col_idx].strip() if len(header_row) > col_idx else ""
     if not current:
         col_letter = col_to_letter(col_idx)
-        cell = f"'{tab}'!{col_letter}1"
-        svc.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=cell,
-            valueInputOption="USER_ENTERED",
-            body={"values": [[header_text]]}
-        ).execute()
-        log.info(f"  [Sheets] Set column {col_letter} header in '{tab}' to '{header_text}'")
+        log.warning(
+            f"  [Sheets] Column {col_letter} header in '{tab}' is blank — "
+            f"expected '{header_text}'. Please add it manually."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -375,7 +413,22 @@ def main():
     log = logging.getLogger(__name__)
     log.info("=" * 60)
     log.info("SEAL applicant processing - run started")
+    set_live("checking", "Scanning applicants sheet")
+    log_run_start("process_applicants")
 
+    rl = RunLogger("process_applicants", log)
+    rl.__enter__()
+    try:
+        _run_applicants(log, rl)
+    except Exception as exc:
+        import traceback
+        rl.log_error("UNKNOWN", str(exc), traceback.format_exc())
+        raise
+    finally:
+        rl.__exit__(None, None, None)
+
+
+def _run_applicants(log, rl):
     # Load config
     with open(CONFIG, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -409,9 +462,10 @@ def main():
     # Build API clients — two separate auth accounts
     gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, hint="sealdirector@gmail.com")
     admin_creds = get_credentials(SCOPES_ADMIN, TOKEN_ADMIN, hint="admin@maxalton.com")
-    sheets_svc  = build("sheets", "v4", credentials=gmail_creds)
-    gmail_svc   = build("gmail", "v1", credentials=gmail_creds)
-    admin_svc   = build("admin", "directory_v1", credentials=admin_creds)
+    http = make_http()
+    sheets_svc  = build("sheets", "v4", http=AuthorizedHttp(gmail_creds, http=http))
+    gmail_svc   = build("gmail", "v1", http=AuthorizedHttp(gmail_creds, http=make_http()))
+    admin_svc   = build("admin", "directory_v1", http=AuthorizedHttp(admin_creds, http=make_http()))
 
     # Read source data
     all_rows = get_sheet_data(sheets_svc, sid, current_tab)
@@ -435,7 +489,7 @@ def main():
 
     # Ensure column O is labelled in both tabs
     for tab in [approved_tab, rejected_tab]:
-        ensure_column_header(sheets_svc, sid, tab, email_sent_col, "Email Sent", log)
+        verify_column_header(sheets_svc, sid, tab, email_sent_col, "Email Sent", log)
 
     # Classify new rows
     new_approved = []   # list of (row, email, name)
@@ -462,14 +516,20 @@ def main():
         status = padded[status_col].strip()
         name   = padded[name_col].strip() if len(padded) > name_col else ""
 
-        if not status or is_rejected(status, keywords):
+        if is_rejected(status, keywords):
             new_rejected.append((row, email, name))
             log.info(f"REJECTED  {email}  (status='{status}')")
+            rl.add_note(f"REJECTED: {name} ({email}) — {status}")
+        elif not status:
+            # No decision yet in column N — skip until a reviewer sets a status
+            log.info(f"SKIPPED   {email}  (status is blank — awaiting review)")
         else:
             new_approved.append((row, email, name))
             log.info(f"APPROVED  {email}  (status='{status}')")
+            rl.add_note(f"APPROVED: {name} ({email}) — {status}")
 
     log.info(f"New this run -> approved: {len(new_approved)}, rejected: {len(new_rejected)}")
+    log_run_msg(f"Applicants: +{len(new_approved)} approved, -{len(new_rejected)} rejected")
 
     # ── Write new rows to destination tabs ────────────────────────────────────
     # Strip column O from source rows before writing — source rows may carry
@@ -485,11 +545,14 @@ def main():
         return result
 
     if new_approved:
+        set_live("adding", "Writing approved rows", step="sheet")
         write_to_next_blank_row(sheets_svc, sid, approved_tab,
                                 clear_col([r for r, _, _ in new_approved], email_sent_col),
                                 start_row, log)
         for _, email, name in new_approved:
+            set_live("adding", "Adding to group", email=email, step="group")
             add_to_google_group(admin_svc, group_email, email, log)
+            log_event("add", email, "APPROVED", name=name)
 
     if new_rejected:
         write_to_next_blank_row(sheets_svc, sid, rejected_tab,
@@ -501,6 +564,19 @@ def main():
     # were added before the email feature existed (self-healing backfill).
     # All column O marks are batched into a single API call per tab to stay
     # within the Sheets write-quota limit (60 writes/minute).
+
+    # Quality check: build cross-reference to detect misclassified rows.
+    # An email should NOT appear in both Approved and Rejected tabs.
+    approved_emails = get_emails_in_tab(sheets_svc, sid, approved_tab, email_col)
+    rejected_emails = get_emails_in_tab(sheets_svc, sid, rejected_tab, email_col)
+    cross_listed = approved_emails & rejected_emails
+    if cross_listed:
+        log.error(
+            f"  [QUALITY CHECK] {len(cross_listed)} email(s) found in BOTH "
+            f"Approved and Rejected tabs — skipping email send for these: "
+            f"{sorted(cross_listed)}"
+        )
+
     for tab, subject, body in [
         (approved_tab,  email_cfg["subject"],            email_cfg["body"]),
         (rejected_tab,  rejection_email_cfg["subject"],  rejection_email_cfg["body"]),
@@ -513,6 +589,19 @@ def main():
             log.info(f"  [Email] {len(pending)} unsent row(s) found in '{tab}'")
         marks = []
         for row_number, email, name in pending:
+            # Quality check: skip emails that appear in both tabs
+            if email.lower() in cross_listed:
+                log.error(
+                    f"  [QUALITY CHECK] BLOCKED email to {email} — found in both "
+                    f"Approved and Rejected tabs. Resolve manually before re-running."
+                )
+                continue
+            # Quality check: verify name is not empty
+            if not name:
+                log.warning(
+                    f"  [QUALITY CHECK] Sending email to {email} with empty name — "
+                    f"greeting will use email address as fallback"
+                )
             sent = send_email(
                 gmail_svc, email_cfg["sender"], email, name,
                 subject, body, log, test_override=test_override
@@ -522,6 +611,18 @@ def main():
         batch_mark_emails_sent(sheets_svc, sid, marks, email_sent_col, log)
 
     log.info("Run complete.")
+    if not new_approved and not new_rejected:
+        log_run_msg("No new applicants to process")
+        log_result("empty")
+        rl.set_rows_processed("0 new")
+    else:
+        log_result("processed")
+        rl.set_rows_processed(f"{len(new_approved)} approved, {len(new_rejected)} rejected")
+        if new_approved:
+            rl.add_action(f"{len(new_approved)} approved, added to group")
+        if new_rejected:
+            rl.add_action(f"{len(new_rejected)} rejected")
+    set_live("idle", "Applicant processing complete")
 
 
 if __name__ == "__main__":

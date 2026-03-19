@@ -32,6 +32,10 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google_auth_httplib2 import AuthorizedHttp
+from proxy_http import make_http
+from tui_status import set_live, log_run_start, log_run_msg, log_event, log_result
+from run_logger import RunLogger
 from playwright.sync_api import sync_playwright
 
 load_dotenv()
@@ -153,30 +157,10 @@ def ensure_tab_exists(svc, spreadsheet_id: str, tab: str) -> None:
     svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
 
 
-def write_to_next_blank_row(
-    svc,
-    spreadsheet_id: str,
-    tab: str,
-    rows: list[list],
-    start_row: int,
-    log: logging.Logger,
-) -> None:
-    """Append *rows* to *tab* starting at the first blank row >= *start_row*.
-
-    Reads column A of *tab* to locate the first truly empty row at or after
-    *start_row* (1-indexed), then writes using values().update() rather than
-    values().append() so that the destination range is exact and predictable.
-
-    Args:
-        svc:            An authenticated Google Sheets service object.
-        spreadsheet_id: The spreadsheet ID string.
-        tab:            The tab name to write into.
-        rows:           A list of row lists (each inner list is one row of values).
-        start_row:      The first row number (1-indexed) that is eligible as a
-                        write target; rows above this are treated as headers/samples.
-        log:            Logger instance for status messages.
-    """
-    # Read column A to find the first blank row at or below start_row
+def _find_next_blank_row(
+    svc, spreadsheet_id: str, tab: str, start_row: int
+) -> int:
+    """Return the 1-indexed first blank row in column A at or below start_row."""
     col_a_range = f"'{tab}'!A:A"
     result = (
         svc.spreadsheets()
@@ -185,46 +169,122 @@ def write_to_next_blank_row(
         .execute()
     )
     col_a: list[list] = result.get("values", [])
-
-    # col_a is 0-indexed; row numbers are 1-indexed
-    next_row = start_row  # default: write at start_row if everything above is blank
     for row_idx in range(start_row - 1, len(col_a)):
         cell_value = col_a[row_idx][0].strip() if col_a[row_idx] else ""
         if cell_value == "":
-            next_row = row_idx + 1  # convert 0-index → 1-index
-            break
-    else:
-        # All cells in col A from start_row onward are non-empty
-        next_row = len(col_a) + 1
+            return row_idx + 1
+    return max(len(col_a) + 1, start_row)
 
-    # Expand the grid if next_row + len(rows) exceeds the current row limit
-    sheet_meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    for s in sheet_meta["sheets"]:
-        if s["properties"]["title"] == tab:
-            current_rows = s["properties"]["gridProperties"]["rowCount"]
-            needed = next_row + len(rows) - 1
-            if needed > current_rows:
-                sheet_id = s["properties"]["sheetId"]
-                svc.spreadsheets().batchUpdate(
-                    spreadsheetId=spreadsheet_id,
-                    body={"requests": [{"appendDimension": {
-                        "sheetId": sheet_id,
-                        "dimension": "ROWS",
-                        "length": needed - current_rows + 50  # add buffer
-                    }}]}
-                ).execute()
-                log.info("  Expanded '%s' grid to %d rows", tab, needed + 50)
-            break
 
-    write_range = f"'{tab}'!A{next_row}"
-    body = {"values": rows}
-    svc.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=write_range,
-        valueInputOption="USER_ENTERED",
-        body=body,
+def write_rows_with_formatting(
+    svc,
+    src_spreadsheet_id: str,
+    src_tab: str,
+    src_row_indices: list[int],
+    dst_spreadsheet_id: str,
+    dst_tab: str,
+    start_row: int,
+    log: logging.Logger,
+) -> int:
+    """Copy rows from source to destination preserving all formatting.
+
+    Uses spreadsheets.get(includeGridData=True) to read full CellData and
+    updateCells to write — this preserves fonts, colours, alignment, and
+    hyperlinks that values().update() silently drops.
+
+    Returns the 1-indexed row number where writing began.
+    """
+    import copy
+
+    next_row = _find_next_blank_row(svc, dst_spreadsheet_id, dst_tab, start_row)
+
+    # ── Read source rows with full cell data ──────────────────────────────
+    src_result = svc.spreadsheets().get(
+        spreadsheetId=src_spreadsheet_id,
+        ranges=[f"'{src_tab}'"],
+        includeGridData=True,
+        fields="sheets.data.rowData,sheets.properties.title"
     ).execute()
-    log.info("  Wrote %d row(s) to '%s'!A%d", len(rows), tab, next_row)
+
+    all_row_data = []
+    for sheet in src_result.get("sheets", []):
+        if sheet["properties"]["title"] == src_tab:
+            all_row_data = sheet["data"][0].get("rowData", [])
+            break
+
+    rows_to_write = []
+    for idx in src_row_indices:
+        rd = copy.deepcopy(all_row_data[idx]) if idx < len(all_row_data) else {}
+        rows_to_write.append(rd)
+
+    # ── Get destination sheet metadata ────────────────────────────────────
+    dst_meta = svc.spreadsheets().get(spreadsheetId=dst_spreadsheet_id).execute()
+    dst_sheet_id = None
+    dst_col_count = None
+    dst_row_count = None
+    for s in dst_meta["sheets"]:
+        if s["properties"]["title"] == dst_tab:
+            dst_sheet_id = s["properties"]["sheetId"]
+            dst_col_count = s["properties"]["gridProperties"]["columnCount"]
+            dst_row_count = s["properties"]["gridProperties"]["rowCount"]
+            break
+    if dst_sheet_id is None:
+        raise ValueError(f"Tab '{dst_tab}' not found in spreadsheet {dst_spreadsheet_id}")
+
+    # ── Expand grid if needed ─────────────────────────────────────────────
+    needed = next_row + len(rows_to_write) - 1
+    if needed > dst_row_count:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=dst_spreadsheet_id,
+            body={"requests": [{"appendDimension": {
+                "sheetId": dst_sheet_id,
+                "dimension": "ROWS",
+                "length": needed - dst_row_count + 50
+            }}]}
+        ).execute()
+        log.info("  Expanded '%s' grid to %d rows", dst_tab, needed + 50)
+
+    # ── Trim rows to destination column count ─────────────────────────────
+    for rd in rows_to_write:
+        rd["values"] = rd.get("values", [])[:dst_col_count]
+
+    # ── Write with full formatting ────────────────────────────────────────
+    requests_body = [
+        {
+            "updateCells": {
+                "rows": [rd],
+                "fields": "userEnteredValue,userEnteredFormat,textFormatRuns",
+                "start": {
+                    "sheetId": dst_sheet_id,
+                    "rowIndex": next_row - 1 + i,
+                    "columnIndex": 0
+                }
+            }
+        }
+        for i, rd in enumerate(rows_to_write)
+    ]
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=dst_spreadsheet_id,
+        body={"requests": requests_body}
+    ).execute()
+    log.info("  Wrote %d row(s) with formatting to '%s'!A%d", len(rows_to_write), dst_tab, next_row)
+
+    # ── Verify write ──────────────────────────────────────────────────────
+    verify = svc.spreadsheets().values().get(
+        spreadsheetId=dst_spreadsheet_id,
+        range=f"'{dst_tab}'!A{next_row}:A{next_row + len(rows_to_write) - 1}"
+    ).execute()
+    written = verify.get("values", [])
+    if len(written) != len(rows_to_write):
+        log.error(
+            "  [Sheets] VERIFY FAILED: expected %d row(s) at '%s'!A%d, "
+            "but read back %d",
+            len(rows_to_write), dst_tab, next_row, len(written),
+        )
+    else:
+        log.info("  [Sheets] Verified %d row(s) written to '%s'", len(written), dst_tab)
+
+    return next_row
 
 
 def get_sheet_id(svc, spreadsheet_id: str, tab: str) -> int:
@@ -274,8 +334,10 @@ def delete_rows(
     """
     sheet_id = get_sheet_id(svc, spreadsheet_id, tab)
 
-    for idx in sorted(row_indices, reverse=True):
-        request = {
+    # Batch all deletions into a single API call (avoids 429 rate limits).
+    # Sorted in reverse so that earlier indices remain valid as rows are removed.
+    requests_body = [
+        {
             "deleteDimension": {
                 "range": {
                     "sheetId": sheet_id,
@@ -285,22 +347,25 @@ def delete_rows(
                 }
             }
         }
-        try:
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"requests": [request]},
-            ).execute()
-            log.info("  Deleted row index %d from '%s'", idx, tab)
-        except HttpError as exc:
-            if exc.resp.status == 403:
-                log.warning(
-                    "  Row %d in '%s' is protected — skipping deletion: %s",
-                    idx,
-                    tab,
-                    exc,
-                )
-            else:
-                raise
+        for idx in sorted(row_indices, reverse=True)
+    ]
+    try:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests_body},
+        ).execute()
+        log.info(
+            "  Deleted %d row(s) from '%s' (indices: %s)",
+            len(row_indices), tab, sorted(row_indices, reverse=True),
+        )
+    except HttpError as exc:
+        if exc.resp.status == 403:
+            log.warning(
+                "  Some rows in '%s' are protected — skipping deletion: %s",
+                tab, exc,
+            )
+        else:
+            raise
 
 
 def remove_from_google_group(
@@ -435,203 +500,195 @@ def slack_deactivate_api(user_id: str, log: logging.Logger) -> bool:
     return False
 
 
-def slack_deactivate_playwright(email: str, log: logging.Logger) -> bool:
-    """Deactivate an active Slack member via the admin panel GUI.
+class _AdminAccountError(Exception):
+    """Raised when trying to deactivate a Workspace Admin — stops retries."""
+    pass
 
-    Mirrors slack_reactivate_playwright from process_challenge.py but for removal:
-      1. Login at sealuw.slack.com/sign_in_with_password
-      2. Load workspace SPA to establish the full session
-      3. Click Admin sidebar → Manage members (opens popup at sealuw.slack.com/admin)
-      4. Search for target email (no Inactive filter — user is active)
-      5. Click data-qa="table_row_actions_button" (the '...' row action button)
-      6. Click 'Deactivate account' from the dropdown
-      7. Click the confirm button in the deactivation modal
-         (labelled "Deactivate" — NOT "Save" like in the reactivation modal)
 
-    Args:
-        email: The email address of the Slack member to deactivate.
-        log:   Logger instance.
+def _slack_deactivate_single(email: str, log: logging.Logger) -> bool:
+    """Single attempt to deactivate a Slack member via the admin panel GUI.
 
-    Returns:
-        True if deactivation succeeded, False otherwise.
+    Uses shared slack_login + open_admin_panel, then:
+      1. Search for target email (no Inactive filter — user is active)
+      2. Hover over row to reveal the '...' action button
+      3. Click '...' → 'Deactivate account'
+      4. Confirm in the deactivation modal (button labelled "Deactivate")
     """
-    if not SLACK_ADMIN_EMAIL or not SLACK_ADMIN_PASSWORD:
-        log.error(
-            "  [Slack] SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD not set "
-            "— cannot deactivate via Playwright"
-        )
-        return False
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
+    from slack_auth import slack_login, open_admin_panel
 
-            # ── Sign in ───────────────────────────────────────────────────────
-            page.goto(f"https://{SLACK_WORKSPACE}/sign_in_with_password")
-            page.wait_for_load_state("networkidle")
-            page.fill('input[data-qa="login_email"]', SLACK_ADMIN_EMAIL)
-            page.click('input[type="password"]')
-            page.keyboard.type(SLACK_ADMIN_PASSWORD, delay=50)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = context.new_page()
 
-            sign_in_btn = (
-                page.query_selector('button[data-qa="signin_button"]')
-                or page.query_selector('button[type="submit"]')
-            )
-            sign_in_btn.click()
-            page.wait_for_load_state("networkidle", timeout=30_000)
-            page.wait_for_timeout(4000)
-
-            if "sign_in" in page.url:
-                log.error(
-                    "  [Slack] Playwright login failed — check "
-                    "SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD in .env"
-                )
-                page.screenshot(path=str(TMP / "slack_deactivate_login_failed.png"))
-                browser.close()
-                return False
-
-            # ── Load workspace SPA ────────────────────────────────────────────
-            page.goto(f"https://{SLACK_WORKSPACE}/", wait_until="load", timeout=30_000)
-            page.wait_for_timeout(10_000)
-
-            # ── Open Manage members via Admin sidebar ─────────────────────────
-            for btn in page.query_selector_all("button"):
-                if btn.inner_text().strip() == "Admin":
-                    btn.click()
-                    break
-            page.wait_for_timeout(2000)
-
-            manage_link = None
-            for el in page.query_selector_all("a"):
-                if "Manage members" in el.inner_text().strip():
-                    manage_link = el
-                    break
-
-            if not manage_link:
-                log.error("  [Slack] Playwright could not find Manage members link")
-                page.screenshot(
-                    path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            admin_href = (
-                manage_link.get_attribute("href") or f"https://{SLACK_WORKSPACE}/admin"
-            )
-            try:
-                from playwright.sync_api import TimeoutError as PWTimeout
-                with context.expect_page(timeout=6000) as popup_info:
-                    manage_link.click()
-                admin_page = popup_info.value
-                admin_page.wait_for_load_state("load", timeout=30_000)
-                admin_page.wait_for_timeout(8000)
-            except Exception:
-                admin_page = page
-                page.goto(admin_href, wait_until="load", timeout=30_000)
-                page.wait_for_timeout(8000)
-
-            # ── Search for the target email (no Inactive filter needed) ───────
-            search = admin_page.query_selector(
-                'input[data-qa="workspace-members__table-header-search_input"], '
-                'input[placeholder*="ilter by name"], input[type="search"]'
-            )
-            if not search:
-                log.error(
-                    "  [Slack] Playwright could not find search input for %s", email
-                )
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            search.fill(email)
-            admin_page.wait_for_timeout(5000)
-
-            # ── Click the '...' row action button ────────────────────────────
-            action_btn = (
-                admin_page.query_selector('[data-qa="table_row_actions_button"]')
-                or admin_page.query_selector('[aria-label*="Actions for"]')
-            )
-            if not action_btn:
-                log.error(
-                    "  [Slack] Playwright could not find row action button for %s", email
-                )
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            action_btn.click()
-            admin_page.wait_for_timeout(2000)
-
-            # ── Click 'Deactivate account' from the dropdown ──────────────────
-            deactivate_btn = admin_page.query_selector(
-                '[data-qa="deactivate_member_button"]'
-            )
-            if not deactivate_btn:
-                for el in admin_page.query_selector_all(
-                    "button, [role='menuitem'], li"
-                ):
-                    txt = el.inner_text().strip().lower()
-                    if ("deactivate account" in txt or txt == "deactivate"
-                            or "revoke invitation" in txt):
-                        deactivate_btn = el
-                        break
-
-            if not deactivate_btn:
-                log.error(
-                    "  [Slack] Playwright could not find Deactivate button for %s", email
-                )
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            deactivate_btn.click()
-            admin_page.wait_for_timeout(2000)
-
-            # ── Handle confirmation modal ─────────────────────────────────────
-            # Slack shows a confirmation dialog.
-            # The confirm button is labelled "Deactivate" — NOT "Save" like
-            # in the reactivation modal.
-            confirm_btn = (
-                admin_page.query_selector('[data-qa="deactivate_confirm_button"]')
-                or admin_page.query_selector('[data-qa="confirm_button"]')
-            )
-            if not confirm_btn:
-                for btn in admin_page.query_selector_all("button"):
-                    txt = btn.inner_text().strip().lower()
-                    if txt in ("deactivate", "deactivate account", "confirm",
-                               "yes", "remove", "revoke", "revoke invitation"):
-                        confirm_btn = btn
-                        break
-
-            if not confirm_btn:
-                log.error(
-                    "  [Slack] Playwright could not find confirmation button "
-                    "in deactivation modal for %s",
-                    email,
-                )
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_deactivate_no_confirm_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            confirm_btn.click()
-            admin_page.wait_for_timeout(2000)
-
-            log.info("  [Slack] Removed from workspace via Playwright: %s", email)
+        # ── Sign in ───────────────────────────────────────────────────────
+        if not slack_login(page, context, log):
             browser.close()
-            return True
+            return False
 
-    except Exception as exc:
-        log.error("  [Slack] Playwright deactivation failed for %s: %s", email, exc)
-        return False
+        # ── Open admin panel ──────────────────────────────────────────────
+        admin_page = open_admin_panel(page, context, log)
+        if not admin_page:
+            browser.close()
+            return False
+
+        # ── Search for the target email ───────────────────────────────────
+        search = admin_page.query_selector(
+            'input[data-qa="workspace-members__table-header-search_input"], '
+            'input[placeholder*="ilter by name"], input[type="search"]'
+        )
+        if not search:
+            log.error("  [Slack] Could not find search input for %s", email)
+            admin_page.screenshot(
+                path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
+            )
+            browser.close()
+            return False
+
+        search.fill(email)
+        admin_page.wait_for_timeout(5000)
+
+        # ── Hover over the member row to reveal the '...' button ──────────
+        # The action button only renders on hover. Use mouse.move on the
+        # name cell (which has a bounding box) to trigger the CSS hover state.
+        name_cell = admin_page.query_selector(
+            '[data-qa-column="workspace-members_table_real_name"]'
+        )
+        if name_cell:
+            box = name_cell.bounding_box()
+            if box:
+                admin_page.mouse.move(
+                    box["x"] + box["width"] / 2,
+                    box["y"] + box["height"] / 2,
+                )
+                admin_page.wait_for_timeout(1500)
+
+        # ── Check if user is an admin (no action button available) ─────────
+        is_admin = admin_page.evaluate("""
+            () => {
+                const row = document.querySelector('[data-qa="workspace-members_table_data_table_row"]');
+                return row ? row.textContent.includes('Workspace Admin') || row.textContent.includes('Workspace Owner') : false;
+            }
+        """)
+        if is_admin:
+            log.error(
+                "  [Slack] %s is a Workspace Admin — cannot deactivate via "
+                "admin panel. Requires manual action by another admin.", email
+            )
+            admin_page.screenshot(
+                path=str(TMP / f"slack_deactivate_admin_{email.split('@')[0]}.png")
+            )
+            browser.close()
+            # Return special sentinel to stop retries
+            raise _AdminAccountError(email)
+
+        # ── Click the '...' row action button ─────────────────────────────
+        action_btn = admin_page.query_selector('[data-qa="table_row_actions_button"]')
+        if not action_btn:
+            log.error("  [Slack] Could not find row action button for %s", email)
+            admin_page.screenshot(
+                path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
+            )
+            browser.close()
+            return False
+
+        action_btn.click()
+        admin_page.wait_for_timeout(2000)
+
+        # ── Click 'Deactivate account' from the dropdown ──────────────────
+        deactivate_btn = admin_page.query_selector(
+            '[data-qa="deactivate_member_button"]'
+        )
+        if not deactivate_btn:
+            for el in admin_page.query_selector_all(
+                "button, [role='menuitem'], li"
+            ):
+                txt = el.inner_text().strip().lower()
+                if ("deactivate account" in txt or txt == "deactivate"
+                        or "revoke invitation" in txt):
+                    deactivate_btn = el
+                    break
+
+        if not deactivate_btn:
+            log.error("  [Slack] Could not find Deactivate button for %s", email)
+            admin_page.screenshot(
+                path=str(TMP / f"slack_deactivate_debug_{email.split('@')[0]}.png")
+            )
+            browser.close()
+            return False
+
+        deactivate_btn.click()
+        admin_page.wait_for_timeout(2000)
+
+        # ── Handle confirmation modal ─────────────────────────────────────
+        confirm_btn = (
+            admin_page.query_selector('[data-qa="deactivate_confirm_button"]')
+            or admin_page.query_selector('[data-qa="confirm_button"]')
+        )
+        if not confirm_btn:
+            for btn in admin_page.query_selector_all("button"):
+                txt = btn.inner_text().strip().lower()
+                if txt in ("deactivate", "deactivate account", "confirm",
+                           "yes", "remove", "revoke", "revoke invitation"):
+                    confirm_btn = btn
+                    break
+
+        if not confirm_btn:
+            log.error(
+                "  [Slack] Could not find confirmation button for %s", email
+            )
+            admin_page.screenshot(
+                path=str(TMP / f"slack_deactivate_no_confirm_{email.split('@')[0]}.png")
+            )
+            browser.close()
+            return False
+
+        confirm_btn.click()
+        admin_page.wait_for_timeout(2000)
+
+        log.info("  [Slack] Removed from workspace via Playwright: %s", email)
+        browser.close()
+        return True
+
+
+def slack_deactivate_playwright(
+    email: str, log: logging.Logger, max_retries: int = 3
+) -> bool:
+    """Deactivate a Slack member with automatic retry on failure.
+
+    Retries up to max_retries times, clearing the saved browser session
+    between attempts to force a fresh login.
+    """
+    from slack_auth import SESSION_FILE as _SESSION_FILE
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            log.info(
+                "  [Slack] Deactivation attempt %d/%d for %s",
+                attempt, max_retries, email,
+            )
+            if _slack_deactivate_single(email, log):
+                return True
+        except _AdminAccountError:
+            log.error(
+                "  [Slack] %s is a Workspace Admin — cannot deactivate automatically. "
+                "Stopping retries. A human must handle this manually.", email,
+            )
+            return False
+        except Exception as exc:
+            log.error(
+                "  [Slack] Playwright deactivation error for %s (attempt %d): %s",
+                email, attempt, exc,
+            )
+
+        if attempt < max_retries:
+            log.info("  [Slack] Clearing session and retrying...")
+            _SESSION_FILE.unlink(missing_ok=True)
+
+    log.error(
+        "  [Slack] All %d deactivation attempts failed for %s", max_retries, email
+    )
+    return False
 
 
 def load_pending_deactivations() -> list[str]:
@@ -700,6 +757,7 @@ def handle_slack_deactivate(email: str, log: logging.Logger) -> None:
         if success:
             remove_pending_deactivation(email)
         else:
+            # Check if it was an admin account (no point retrying)
             log.warning(
                 "  [Slack] Deactivation failed for %s — queued for retry next run", email
             )
@@ -715,7 +773,22 @@ def handle_slack_deactivate(email: str, log: logging.Logger) -> None:
 def main() -> None:
     log = _setup_logging()
     log.info("=== Clan Cleanup started ===")
+    set_live("checking", "Scanning clan life sheet")
+    log_run_start("process_clan_cleanup")
 
+    rl = RunLogger("process_clan_cleanup", log)
+    rl.__enter__()
+    try:
+        _run_clan_cleanup(log, rl)
+    except Exception as exc:
+        import traceback as tb
+        rl.log_error("UNKNOWN", str(exc), tb.format_exc())
+        raise
+    finally:
+        rl.__exit__(None, None, None)
+
+
+def _run_clan_cleanup(log, rl):
     # ── Load config ───────────────────────────────────────────────────────────
     with open(CONFIG, encoding="utf-8") as fh:
         cfg_root = yaml.safe_load(fh)
@@ -735,11 +808,11 @@ def main() -> None:
     # ── Authenticate ──────────────────────────────────────────────────────────
     log.info("Authenticating (Sheets)…")
     gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, "sealdirector@gmail.com")
-    sheets_svc  = build("sheets", "v4", credentials=gmail_creds)
+    sheets_svc  = build("sheets", "v4", http=AuthorizedHttp(gmail_creds, http=make_http()))
 
     log.info("Authenticating (Admin SDK)…")
     admin_creds = get_credentials(SCOPES_ADMIN, TOKEN_ADMIN, "admin@maxalton.com")
-    admin_svc   = build("admin", "directory_v1", credentials=admin_creds)
+    admin_svc   = build("admin", "directory_v1", http=AuthorizedHttp(admin_creds, http=make_http()))
 
     # ── Retry previously failed Slack deactivations ───────────────────────────
     pending = load_pending_deactivations()
@@ -762,11 +835,15 @@ def main() -> None:
                 success = slack_deactivate_playwright(email, log)
                 if success:
                     log.info("  [Slack] Retry succeeded for %s", email)
-                    remove_pending_deactivation(email)
                 else:
                     log.warning(
-                        "  [Slack] Retry failed again for %s — will try next run", email
+                        "  [Slack] Retry failed for %s — removing from queue "
+                        "(error logged for human review)", email
                     )
+                # Either way, remove from pending to avoid infinite retry loops.
+                # Successful deactivations and permanent failures (admin accounts)
+                # should not be retried.
+                remove_pending_deactivation(email)
 
     # ── Read Associates tab ───────────────────────────────────────────────────
     log.info("Reading Associates tab from SEAL Clan Life sheet…")
@@ -813,77 +890,142 @@ def main() -> None:
         len(affiliate_rows),
     )
 
-    # ── Collect row indices for deletion (processed after all writes) ─────────
+    # ── Collect row indices for deletion (only after verified writes) ────────
     rows_to_delete: list[int] = []
+    write_failures: list[int] = []
+
+    def _write_and_track(
+        src_indices: list[int],
+        dst_sid: str,
+        dst_tab: str,
+        category: str,
+    ) -> bool:
+        """Write rows with formatting and return True if verified."""
+        wrote_row = write_rows_with_formatting(
+            sheets_svc,
+            clan_life_sheet_id, associates_tab,
+            src_indices,
+            dst_sid, dst_tab,
+            start_row, log,
+        )
+        # Verification is done inside write_rows_with_formatting.
+        # Double-check by reading back column A at the write location.
+        verify = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=dst_sid,
+            range=f"'{dst_tab}'!A{wrote_row}:A{wrote_row + len(src_indices) - 1}"
+        ).execute()
+        written = verify.get("values", [])
+        if len(written) != len(src_indices):
+            log.error(
+                "  [Sheets] %s write to '%s' NOT verified — "
+                "skipping source row deletion to prevent data loss",
+                category, dst_tab,
+            )
+            return False
+        return True
 
     # ── Process GameOver rows ─────────────────────────────────────────────────
     if gameover_rows:
         log.info("Processing GameOver rows → %s", ex_communicado_tab)
-        write_to_next_blank_row(
-            sheets_svc,
-            aad_sheet_id,
-            ex_communicado_tab,
-            [r for _, r in gameover_rows],
-            start_row,
-            log,
-        )
+        src_indices = [idx for idx, _ in gameover_rows]
+        verified = _write_and_track(src_indices, aad_sheet_id, ex_communicado_tab, "GameOver")
+
         for list_idx, row in gameover_rows:
             member_email = row[email_col].strip() if len(row) > email_col else ""
+            member_name = row[1].strip() if len(row) > 1 else ""
             if member_email:
+                set_live("removing", "GameOver — removing", email=member_email, step="group")
                 remove_from_google_group(admin_svc, active_group_email, member_email, log)
+                set_live("removing", "GameOver — deactivating Slack", email=member_email, step="slack")
                 handle_slack_deactivate(member_email, log)
+                log_event("remove", member_email, "REMOVED", reason="GameOver flag")
+                rl.add_note(f"GAMEOVER → Ex-Communicado: {member_name} ({member_email})")
             else:
                 log.warning(
                     "  Row %d has no email in column AP — skipping group removal and Slack deactivation",
                     list_idx + 1,
                 )
-            rows_to_delete.append(list_idx)
+            if verified:
+                rows_to_delete.append(list_idx)
+            else:
+                write_failures.append(list_idx)
 
     # ── Process Ex-Associate rows ─────────────────────────────────────────────
     if ex_associate_rows:
         log.info("Processing Ex-Associate rows → %s", ex_associate_tab)
-        write_to_next_blank_row(
-            sheets_svc,
-            aad_sheet_id,
-            ex_associate_tab,
-            [r for _, r in ex_associate_rows],
-            start_row,
-            log,
-        )
+        src_indices = [idx for idx, _ in ex_associate_rows]
+        verified = _write_and_track(src_indices, aad_sheet_id, ex_associate_tab, "Ex-Associate")
+
         for list_idx, row in ex_associate_rows:
             member_email = row[email_col].strip() if len(row) > email_col else ""
+            member_name = row[1].strip() if len(row) > 1 else ""
             if member_email:
+                set_live("removing", "Ex-Associate — removing", email=member_email, step="group")
                 remove_from_google_group(admin_svc, active_group_email, member_email, log)
+                set_live("removing", "Ex-Associate — deactivating Slack", email=member_email, step="slack")
                 handle_slack_deactivate(member_email, log)
+                log_event("remove", member_email, "REMOVED", reason="Ex-Associate")
+                rl.add_note(f"EX-ASSOCIATE → Ex-Associate tab: {member_name} ({member_email})")
             else:
                 log.warning(
                     "  Row %d has no email in column AP — skipping group removal and Slack deactivation",
                     list_idx + 1,
                 )
-            rows_to_delete.append(list_idx)
+            if verified:
+                rows_to_delete.append(list_idx)
+            else:
+                write_failures.append(list_idx)
 
     # ── Process Affiliate rows ────────────────────────────────────────────────
     if affiliate_rows:
         log.info("Processing Affiliate rows → %s", affiliates_tab)
-        write_to_next_blank_row(
-            sheets_svc,
-            clan_life_sheet_id,
-            affiliates_tab,
-            [r for _, r in affiliate_rows],
-            start_row,
-            log,
-        )
-        for list_idx, _ in affiliate_rows:
-            rows_to_delete.append(list_idx)
+        src_indices = [idx for idx, _ in affiliate_rows]
+        verified = _write_and_track(src_indices, clan_life_sheet_id, affiliates_tab, "Affiliate")
+
+        for list_idx, row in affiliate_rows:
+            member_email = row[email_col].strip() if len(row) > email_col else ""
+            member_name = row[1].strip() if len(row) > 1 else ""
+            if member_email:
+                rl.add_note(f"AFFILIATE → Affiliates tab: {member_name} ({member_email})")
+            if verified:
+                rows_to_delete.append(list_idx)
+            else:
+                write_failures.append(list_idx)
         # No group removal for affiliates
 
-    # ── Delete processed rows from Associates ─────────────────────────────────
+    # ── Report write failures ─────────────────────────────────────────────────
+    if write_failures:
+        log.error(
+            "  [Sheets] %d row(s) NOT deleted from Associates due to unverified "
+            "destination writes: row indices %s",
+            len(write_failures), write_failures,
+        )
+
+    # ── Delete processed rows from Associates (only verified writes) ──────────
     if rows_to_delete:
-        log.info("Deleting %d processed row(s) from Associates…", len(rows_to_delete))
+        log.info("Deleting %d verified row(s) from Associates…", len(rows_to_delete))
         delete_rows(sheets_svc, clan_life_sheet_id, associates_tab, rows_to_delete, log)
     else:
         log.info("No rows to delete.")
 
+    total_processed = len(gameover_rows) + len(ex_associate_rows) + len(affiliate_rows)
+    if total_processed == 0:
+        log_run_msg("Clan cleanup: no status triggers found")
+        log_result("empty")
+        rl.set_rows_processed("0 triggers")
+    else:
+        log_run_msg(f"Clan cleanup: {len(gameover_rows)} GameOver, {len(ex_associate_rows)} Ex-Assoc, {len(affiliate_rows)} Affiliate")
+        log_result("processed")
+        rl.set_rows_processed(f"{len(gameover_rows)} GameOver, {len(ex_associate_rows)} Ex-Assoc, {len(affiliate_rows)} Affiliate")
+        if gameover_rows:
+            rl.add_action(f"{len(gameover_rows)} GameOver → Ex-Communicado")
+        if ex_associate_rows:
+            rl.add_action(f"{len(ex_associate_rows)} Ex-Associate → Ex-Associate tab")
+        if affiliate_rows:
+            rl.add_action(f"{len(affiliate_rows)} Affiliate → Affiliates tab")
+    if write_failures:
+        rl.log_error("SHEET_003", f"{len(write_failures)} unverified write(s) — rows not deleted")
+    set_live("idle", "Clan cleanup complete")
     log.info("=== Clan Cleanup complete ===")
 
 

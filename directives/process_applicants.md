@@ -24,13 +24,15 @@ python execution/process_applicants.py
 4. **Deduplicate** — collect all emails already in "Approved" and "Rejected" tabs; skip any matching row
 5. **Classify** each new row:
    - Column N contains a rejection keyword → **Rejected**
-   - Column N does not match any keyword (including blank) → **Approved**
+   - Column N is blank → **Skipped** (awaiting reviewer decision — not processed until status is set)
+   - Column N has a non-blank value that is not a rejection keyword → **Approved**
 6. **Append** approved rows to "Approved" tab; rejected rows to "Rejected" tab
 7. **Create tabs** if they don't exist yet (copies header from Current Applicants)
-8. **Ensure column O header** ("Email Sent") is set in both Approved and Rejected tabs
+8. **Verify column O header** ("Email Sent") exists in both Approved and Rejected tabs — warns if missing but does NOT create columns
 9. **For each approved row:** add email to Google Group via Admin SDK
-10. **Scan Approved tab** for rows where column O is blank → send approval email → write timestamp to column O
-11. **Scan Rejected tab** for rows where column O is blank → send rejection email → write timestamp to column O
+10. **Quality check** — cross-reference Approved and Rejected tabs; block email sending for any email that appears in both (flags for manual resolution)
+11. **Scan Approved tab** for rows where column O is blank → send approval email → write timestamp to column O
+12. **Scan Rejected tab** for rows where column O is blank → send rejection email → write timestamp to column O
 12. **Ensure 10 empty rows** at the bottom of both tabs
 13. **Log** all actions to `.tmp/process_applicants.log`
 

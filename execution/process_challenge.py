@@ -48,6 +48,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google_auth_httplib2 import AuthorizedHttp
+from proxy_http import make_http
+from tui_status import set_live, log_run_start, log_run_msg, log_event, log_result
+from run_logger import RunLogger
 
 from playwright.sync_api import sync_playwright
 
@@ -123,19 +127,6 @@ def ensure_tab_exists(svc, spreadsheet_id: str, tab: str, header: list | None = 
             ).execute()
 
 
-def append_rows(svc, spreadsheet_id: str, tab: str, rows: list):
-    """Append rows to a tab, inserting new rows below existing content.
-    Anchoring to A1 ensures the API always starts from column A regardless
-    of how far right existing data extends in the sheet."""
-    svc.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range=f"'{tab}'!A1",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows}
-    ).execute()
-
-
 def write_to_next_blank_row(svc, spreadsheet_id: str, tab: str, rows: list,
                              start_row: int, log) -> int:
     """Write rows to the first blank row in column A at or below start_row (1-indexed).
@@ -164,6 +155,21 @@ def write_to_next_blank_row(svc, spreadsheet_id: str, tab: str, rows: list,
         body={"values": rows}
     ).execute()
     log.info(f"  [Sheets] Wrote {len(rows)} row(s) to '{tab}' starting at row {next_row}")
+
+    # ── Verify write ──────────────────────────────────────────────────────
+    verify = svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{tab}'!A{next_row}:A{next_row + len(rows) - 1}"
+    ).execute()
+    written = verify.get("values", [])
+    if len(written) != len(rows):
+        log.error(
+            f"  [Sheets] VERIFY FAILED: expected {len(rows)} row(s) at '{tab}'!A{next_row}, "
+            f"but read back {len(written)}. Data may not have been written correctly."
+        )
+    else:
+        log.info(f"  [Sheets] Verified {len(written)} row(s) written to '{tab}'")
+
     return next_row
 
 
@@ -262,6 +268,21 @@ def copy_rows_with_formatting(svc, src_sid: str, src_tab: str,
     ).execute()
     log.info(f"  [Sheets] Copied {len(rows_to_write)} row(s) with formatting "
              f"to '{dst_tab}' starting at row {dst_start_row}")
+
+    # ── Verify write (use wide range since column A may be empty) ────────
+    verify = svc.spreadsheets().values().get(
+        spreadsheetId=dst_sid,
+        range=f"'{dst_tab}'!A{dst_start_row}:AP{dst_start_row + len(rows_to_write) - 1}"
+    ).execute()
+    written = verify.get("values", [])
+    if len(written) != len(rows_to_write):
+        log.error(
+            f"  [Sheets] VERIFY FAILED: expected {len(rows_to_write)} row(s) at "
+            f"'{dst_tab}' rows {dst_start_row}-{dst_start_row + len(rows_to_write) - 1}, "
+            f"but read back {len(written)}"
+        )
+    else:
+        log.info(f"  [Sheets] Verified {len(written)} row(s) copied to '{dst_tab}'")
 
 
 def copy_formula_down(svc, spreadsheet_id: str, tab: str,
@@ -440,172 +461,102 @@ def slack_invite_user(email: str, log) -> bool:
     return False
 
 
-def slack_invite_playwright(email: str, log) -> bool:
-    """Invite a new member to the Slack workspace via the admin panel GUI.
+def _slack_invite_single(email: str, log) -> bool:
+    """Single attempt to invite via admin panel GUI."""
+    from slack_auth import slack_login, open_admin_panel
 
-    The users.admin.invite API endpoint requires the legacy 'client' scope
-    which is not available on modern Slack apps.  This function uses the admin
-    panel's 'Invite People' modal instead.
-
-    Confirmed working flow (dry-run verified):
-      1. Login at sealuw.slack.com/sign_in_with_password (minimal browser config)
-      2. Load workspace SPA (sealuw.slack.com/ -> redirects to app.slack.com)
-      3. Open admin popup via context.expect_page()
-      4. Click 'Invite People' button
-      5. Click data-qa="invite_modal_select-input" (contenteditable div),
-         type the email, press Tab to confirm the chip
-      6. Click 'Send' (exact text match; button is disabled if email already a member)
-    """
     if not SLACK_ADMIN_EMAIL or not SLACK_ADMIN_PASSWORD:
-        log.error(
-            "  [Slack] SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD not set "
-            "— cannot invite via Playwright"
-        )
+        log.error("  [Slack] SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD not set")
         return False
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
 
-            # ── Login (same as reactivate) ─────────────────────────────────────
-            page.goto(f"https://{SLACK_WORKSPACE}/sign_in_with_password")
-            page.wait_for_load_state("networkidle")
-            page.fill('input[data-qa="login_email"]', SLACK_ADMIN_EMAIL)
-            page.click('input[type="password"]')
-            page.keyboard.type(SLACK_ADMIN_PASSWORD, delay=50)
-            sign_in_btn = (
-                page.query_selector('button[data-qa="signin_button"]')
-                or page.query_selector('button[type="submit"]')
-            )
-            sign_in_btn.click()
-            page.wait_for_load_state("networkidle", timeout=30000)
-            page.wait_for_timeout(4000)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = context.new_page()
 
-            if "sign_in" in page.url:
-                log.error(
-                    "  [Slack] Playwright login failed — check "
-                    "SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD in .env"
-                )
-                browser.close()
-                return False
-
-            # ── Load workspace SPA (same as reactivate) ────────────────────────
-            page.goto(f"https://{SLACK_WORKSPACE}/", wait_until="load", timeout=30000)
-            page.wait_for_timeout(10000)
-
-            # ── Open admin panel popup (same as reactivate) ────────────────────
-            for btn in page.query_selector_all("button"):
-                if btn.inner_text().strip() == "Admin":
-                    btn.click()
-                    break
-            page.wait_for_timeout(2000)
-
-            manage_link = None
-            for el in page.query_selector_all("a"):
-                if "Manage members" in el.inner_text().strip():
-                    manage_link = el
-                    break
-
-            if not manage_link:
-                log.error("  [Slack] Playwright could not find Manage members link")
-                page.screenshot(
-                    path=str(TMP / f"slack_invite_debug_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            admin_href = manage_link.get_attribute("href") or f"https://{SLACK_WORKSPACE}/admin"
-            try:
-                from playwright.sync_api import TimeoutError as PWTimeout
-                with context.expect_page(timeout=6000) as popup_info:
-                    manage_link.click()
-                admin_page = popup_info.value
-                admin_page.wait_for_load_state("load", timeout=30000)
-                admin_page.wait_for_timeout(8000)
-            except Exception:
-                admin_page = page
-                page.goto(admin_href, wait_until="load", timeout=30000)
-                page.wait_for_timeout(8000)
-
-            # ── Click "Invite People" ──────────────────────────────────────────
-            invite_btn = None
-            for btn in admin_page.query_selector_all("button"):
-                if "invite people" in btn.inner_text().strip().lower():
-                    invite_btn = btn
-                    break
-
-            if not invite_btn:
-                log.error("  [Slack] Playwright could not find Invite People button")
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_invite_debug_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            invite_btn.click()
-            admin_page.wait_for_timeout(2000)
-
-            # ── Fill in the email in the contenteditable "To:" field ───────────
-            # data-qa="invite_modal_select-input" confirmed via dry-run inspection
-            email_field = (
-                admin_page.query_selector('[data-qa="invite_modal_select-input"]')
-                or admin_page.query_selector('[contenteditable="true"]')
-            )
-            if not email_field:
-                log.error(
-                    f"  [Slack] Playwright could not find email input in invite dialog "
-                    f"for {email}"
-                )
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_invite_debug_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            email_field.click()
-            admin_page.wait_for_timeout(500)
-            admin_page.keyboard.type(email, delay=30)
-            admin_page.keyboard.press("Tab")   # confirm the email chip
-            admin_page.wait_for_timeout(1500)
-
-            # ── Click Send ─────────────────────────────────────────────────────
-            send_btn = None
-            for btn in admin_page.query_selector_all("button"):
-                if btn.inner_text().strip().lower() == "send":
-                    send_btn = btn
-                    break
-
-            if not send_btn:
-                log.error(f"  [Slack] Playwright could not find Send button for {email}")
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_invite_debug_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            # A disabled Send means Slack flagged the email (e.g. already a member)
-            if send_btn.evaluate("b => b.disabled"):
-                log.warning(
-                    f"  [Slack] Invite Send button is disabled for {email} "
-                    "— possibly already a member or invalid email"
-                )
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_invite_disabled_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            send_btn.click()
-            admin_page.wait_for_timeout(2000)
-
-            log.info(f"  [Slack] Invite sent via Playwright: {email}")
+        if not slack_login(page, context, log):
             browser.close()
-            return True
+            return False
 
-    except Exception as e:
-        log.error(f"  [Slack] Playwright invite failed for {email}: {e}")
-        return False
+        admin_page = open_admin_panel(page, context, log)
+        if not admin_page:
+            browser.close()
+            return False
+
+        # ── Click "Invite People" ──────────────────────────────────────────
+        invite_btn = None
+        for btn in admin_page.query_selector_all("button"):
+            if "invite people" in btn.inner_text().strip().lower():
+                invite_btn = btn
+                break
+        if not invite_btn:
+            log.error("  [Slack] Could not find Invite People button")
+            admin_page.screenshot(path=str(TMP / f"slack_invite_debug_{email.split('@')[0]}.png"))
+            browser.close()
+            return False
+
+        invite_btn.click()
+        admin_page.wait_for_timeout(2000)
+
+        # ── Fill email in contenteditable "To:" field ──────────────────────
+        email_field = (
+            admin_page.query_selector('[data-qa="invite_modal_select-input"]')
+            or admin_page.query_selector('[contenteditable="true"]')
+        )
+        if not email_field:
+            log.error(f"  [Slack] Could not find email input for {email}")
+            admin_page.screenshot(path=str(TMP / f"slack_invite_debug_{email.split('@')[0]}.png"))
+            browser.close()
+            return False
+
+        email_field.click()
+        admin_page.wait_for_timeout(500)
+        admin_page.keyboard.type(email, delay=30)
+        admin_page.keyboard.press("Tab")
+        admin_page.wait_for_timeout(1500)
+
+        # ── Click Send ─────────────────────────────────────────────────────
+        send_btn = None
+        for btn in admin_page.query_selector_all("button"):
+            if btn.inner_text().strip().lower() == "send":
+                send_btn = btn
+                break
+        if not send_btn:
+            log.error(f"  [Slack] Could not find Send button for {email}")
+            admin_page.screenshot(path=str(TMP / f"slack_invite_debug_{email.split('@')[0]}.png"))
+            browser.close()
+            return False
+
+        if send_btn.evaluate("b => b.disabled"):
+            log.warning(f"  [Slack] Send disabled for {email} — possibly already a member")
+            admin_page.screenshot(path=str(TMP / f"slack_invite_disabled_{email.split('@')[0]}.png"))
+            browser.close()
+            return False
+
+        send_btn.click()
+        admin_page.wait_for_timeout(2000)
+        log.info(f"  [Slack] Invite sent via Playwright: {email}")
+        browser.close()
+        return True
+
+
+def slack_invite_playwright(email: str, log, max_retries: int = 3) -> bool:
+    """Invite a new member with automatic retry on failure."""
+    from slack_auth import SESSION_FILE as _SESSION_FILE
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            log.info(f"  [Slack] Invite attempt {attempt}/{max_retries} for {email}")
+            if _slack_invite_single(email, log):
+                return True
+        except Exception as e:
+            log.error(f"  [Slack] Invite error for {email} (attempt {attempt}): {e}")
+        if attempt < max_retries:
+            log.info("  [Slack] Clearing session and retrying...")
+            _SESSION_FILE.unlink(missing_ok=True)
+
+    log.error(f"  [Slack] All {max_retries} invite attempts failed for {email}")
+    return False
 
 
 def slack_reactivate_api(user_id: str, log) -> bool:
@@ -629,243 +580,166 @@ def slack_reactivate_api(user_id: str, log) -> bool:
     return False
 
 
-def slack_reactivate_playwright(email: str, log) -> bool:
-    """Reactivate a deactivated Slack member via the admin panel GUI.
+def _slack_reactivate_single(email: str, log) -> bool:
+    """Single attempt to reactivate a deactivated Slack member via admin panel GUI."""
+    from slack_auth import slack_login, open_admin_panel
 
-    Confirmed working flow (discovered through extensive debugging):
-      1. Login at sealuw.slack.com/sign_in_with_password (minimal browser config)
-      2. Load workspace SPA (sealuw.slack.com/ → redirects to app.slack.com)
-         to establish the full session required by the admin panel
-      3. Click Admin sidebar button → Manage members (opens popup at sealuw.slack.com/admin)
-         Note: /admin/deactivated_members causes a React crash in headless mode;
-         the Members page at /admin works fine and supports filtering
-      4. Apply 'Inactive' billing status filter via JavaScript (filter panel uses
-         ReactModal which intercepts Playwright's native click — JS bypasses it)
-      5. Search for target email — deactivated member appears in filtered results
-      6. Click data-qa="table_row_actions_button" (the '...' row action button)
-      7. Click 'Activate account' from the dropdown
-      8. In the confirmation modal: select 'Regular Member' radio, click 'Save'
-         (The confirm button is labeled "Save" — not "Activate" or "Confirm")
-    """
-    if not SLACK_ADMIN_EMAIL or not SLACK_ADMIN_PASSWORD:
-        log.error(
-            "  [Slack] SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD not set "
-            "— cannot reactivate via Playwright"
-        )
-        return False
-    try:
-        with sync_playwright() as p:
-            # Minimal launch — anti-detection args break React rendering on login page
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = context.new_page()
 
-            # ── Sign in ───────────────────────────────────────────────────────
-            page.goto(f"https://{SLACK_WORKSPACE}/sign_in_with_password")
-            page.wait_for_load_state("networkidle")
-
-            # fill() works for email (no React event issues on that field)
-            page.fill('input[data-qa="login_email"]', SLACK_ADMIN_EMAIL)
-
-            # keyboard.type() required for password — fill() doesn't trigger React onChange
-            page.click('input[type="password"]')
-            page.keyboard.type(SLACK_ADMIN_PASSWORD, delay=50)
-
-            sign_in_btn = (
-                page.query_selector('button[data-qa="signin_button"]')
-                or page.query_selector('button[type="submit"]')
-            )
-            sign_in_btn.click()
-            page.wait_for_load_state("networkidle", timeout=30000)
-            page.wait_for_timeout(4000)
-
-            if "sign_in" in page.url:
-                log.error(
-                    "  [Slack] Playwright login failed — still on sign-in page. "
-                    "Check SLACK_ADMIN_EMAIL / SLACK_ADMIN_PASSWORD in .env"
-                )
-                page.screenshot(path=str(TMP / "slack_login_failed.png"))
-                browser.close()
-                return False
-
-            # ── Load workspace SPA to establish full session ───────────────────
-            # After password login the browser is at ssb/redirect.
-            # The admin panel needs the full workspace SPA session — visiting the
-            # workspace root triggers the required session initialization.
-            # Using wait_until="load" because the SPA never reaches networkidle
-            # (it holds persistent WebSocket connections).
-            page.goto(f"https://{SLACK_WORKSPACE}/", wait_until="load", timeout=30000)
-            page.wait_for_timeout(10000)                    # let SPA fully boot
-
-            # ── Open Manage members via Admin sidebar (opens as popup tab) ────
-            # Click the Admin button in the sidebar
-            for btn in page.query_selector_all("button"):
-                if btn.inner_text().strip() == "Admin":
-                    btn.click()
-                    break
-            page.wait_for_timeout(2000)
-
-            # Find the Manage members link (href → sealuw.slack.com/admin)
-            manage_link = None
-            for el in page.query_selector_all("a"):
-                if "Manage members" in el.inner_text().strip():
-                    manage_link = el
-                    break
-
-            if not manage_link:
-                log.error("  [Slack] Playwright could not find Manage members link")
-                page.screenshot(path=str(TMP / f"slack_debug_{email.split('@')[0]}.png"))
-                browser.close()
-                return False
-
-            admin_href = manage_link.get_attribute("href") or f"https://{SLACK_WORKSPACE}/admin"
-
-            # Slack opens admin in a new tab — capture the popup
-            try:
-                from playwright.sync_api import TimeoutError as PWTimeout
-                with context.expect_page(timeout=6000) as popup_info:
-                    manage_link.click()
-                admin_page = popup_info.value
-                admin_page.wait_for_load_state("load", timeout=30000)
-                admin_page.wait_for_timeout(8000)
-            except Exception:
-                # No popup — navigate in same page
-                admin_page = page
-                page.goto(admin_href, wait_until="load", timeout=30000)
-                page.wait_for_timeout(8000)
-
-            # ── Apply Inactive billing status filter via JavaScript ────────────
-            # The filter panel uses ReactModal which intercepts Playwright's native
-            # click on labels — JS evaluation bypasses this restriction.
-            for btn in admin_page.query_selector_all("button"):
-                if btn.inner_text().strip() == "Filter":
-                    btn.click()
-                    break
-            admin_page.wait_for_timeout(2000)
-
-            result = admin_page.evaluate("""
-                () => {
-                    const popover = document.querySelector(
-                        '.c-data_table_header_multi_filter__pop_over_body, ' +
-                        '[class*="multi_filter"], .c-popover'
-                    );
-                    const container = popover || document;
-                    // Try checkbox by associated label
-                    for (const inp of container.querySelectorAll('input[type="checkbox"]')) {
-                        const lbl = document.querySelector('label[for="' + inp.id + '"]');
-                        if (lbl && lbl.textContent.trim() === 'Inactive') {
-                            inp.click();
-                            return 'checkbox clicked: ' + inp.id;
-                        }
-                    }
-                    // Fallback: leaf-node element with exact text 'Inactive'
-                    for (const el of document.querySelectorAll('*')) {
-                        if (el.childElementCount === 0 && el.textContent.trim() === 'Inactive') {
-                            el.click();
-                            return 'element clicked: ' + el.tagName;
-                        }
-                    }
-                    return null;
-                }
-            """)
-            log.info(f"  [Slack] Inactive filter JS result: {result}")
-            admin_page.wait_for_timeout(2000)
-            admin_page.keyboard.press("Escape")             # close filter panel
-            admin_page.wait_for_timeout(1000)
-
-            # ── Search for the target email ───────────────────────────────────
-            search = admin_page.query_selector(
-                'input[data-qa="workspace-members__table-header-search_input"], '
-                'input[placeholder*="ilter by name"], input[type="search"]'
-            )
-            if not search:
-                log.error(f"  [Slack] Playwright could not find search input for {email}")
-                admin_page.screenshot(path=str(TMP / f"slack_debug_{email.split('@')[0]}.png"))
-                browser.close()
-                return False
-
-            search.fill(email)
-            admin_page.wait_for_timeout(5000)
-
-            # ── Click the '...' row action button ────────────────────────────
-            action_btn = (
-                admin_page.query_selector('[data-qa="table_row_actions_button"]')
-                or admin_page.query_selector('[aria-label*="Actions for"]')
-            )
-            if not action_btn:
-                log.error(f"  [Slack] Playwright could not find row action button for {email}")
-                admin_page.screenshot(path=str(TMP / f"slack_debug_{email.split('@')[0]}.png"))
-                browser.close()
-                return False
-
-            action_btn.click()
-            admin_page.wait_for_timeout(2000)
-
-            # ── Click 'Activate account' from the dropdown ────────────────────
-            activate_btn = None
-            for el in admin_page.query_selector_all("button, [role='menuitem'], li"):
-                txt = el.inner_text().strip().lower()
-                if "activate account" in txt or txt == "activate" or "reactivate" in txt:
-                    activate_btn = el
-                    break
-
-            if not activate_btn:
-                log.error(f"  [Slack] Playwright could not find Activate button for {email}")
-                admin_page.screenshot(path=str(TMP / f"slack_debug_{email.split('@')[0]}.png"))
-                browser.close()
-                return False
-
-            activate_btn.click()
-            admin_page.wait_for_timeout(2000)
-
-            # ── Handle "Activate account" confirmation modal ───────────────────
-            # Slack shows a modal: choose account type (radio: "Regular Member")
-            # then click "Save".  The confirm button text is "Save" — not
-            # "Activate", "Confirm", or "Yes".
-            radio = admin_page.query_selector('input[type="radio"]')
-            if radio:
-                radio.click()
-                admin_page.wait_for_timeout(500)
-
-            save_btn = (
-                admin_page.query_selector('[data-qa="activate_confirm_button"]')
-                or admin_page.query_selector('[data-qa="reactivate_confirm_button"]')
-                or admin_page.query_selector('[data-qa="save_button"]')
-            )
-            if not save_btn:
-                for btn in admin_page.query_selector_all("button"):
-                    txt = btn.inner_text().strip().lower()
-                    if txt == "save":
-                        save_btn = btn
-                        break
-            if not save_btn:
-                for btn in admin_page.query_selector_all("button"):
-                    txt = btn.inner_text().strip().lower()
-                    if txt in ("confirm", "activate", "reactivate", "yes"):
-                        save_btn = btn
-                        break
-
-            if not save_btn:
-                log.error(
-                    f"  [Slack] Playwright could not find Save button in "
-                    f"confirmation modal for {email}"
-                )
-                admin_page.screenshot(
-                    path=str(TMP / f"slack_no_save_{email.split('@')[0]}.png")
-                )
-                browser.close()
-                return False
-
-            save_btn.click()
-            admin_page.wait_for_timeout(2000)
-
-            log.info(f"  [Slack] Reactivated via Playwright: {email}")
+        if not slack_login(page, context, log):
             browser.close()
-            return True
+            return False
 
-    except Exception as e:
-        log.error(f"  [Slack] Playwright reactivation failed for {email}: {e}")
-        return False
+        admin_page = open_admin_panel(page, context, log)
+        if not admin_page:
+            browser.close()
+            return False
+
+        # ── Apply Inactive billing status filter via JavaScript ────────────
+        for btn in admin_page.query_selector_all("button"):
+            if btn.inner_text().strip() == "Filter":
+                btn.click()
+                break
+        admin_page.wait_for_timeout(2000)
+
+        result = admin_page.evaluate("""
+            () => {
+                const popover = document.querySelector(
+                    '.c-data_table_header_multi_filter__pop_over_body, ' +
+                    '[class*="multi_filter"], .c-popover'
+                );
+                const container = popover || document;
+                for (const inp of container.querySelectorAll('input[type="checkbox"]')) {
+                    const lbl = document.querySelector('label[for="' + inp.id + '"]');
+                    if (lbl && lbl.textContent.trim() === 'Inactive') {
+                        inp.click();
+                        return 'checkbox clicked: ' + inp.id;
+                    }
+                }
+                for (const el of document.querySelectorAll('*')) {
+                    if (el.childElementCount === 0 && el.textContent.trim() === 'Inactive') {
+                        el.click();
+                        return 'element clicked: ' + el.tagName;
+                    }
+                }
+                return null;
+            }
+        """)
+        log.info(f"  [Slack] Inactive filter JS result: {result}")
+        admin_page.wait_for_timeout(2000)
+        admin_page.keyboard.press("Escape")
+        admin_page.wait_for_timeout(1000)
+
+        # ── Search for the target email ───────────────────────────────────
+        search = admin_page.query_selector(
+            'input[data-qa="workspace-members__table-header-search_input"], '
+            'input[placeholder*="ilter by name"], input[type="search"]'
+        )
+        if not search:
+            log.error(f"  [Slack] Could not find search input for {email}")
+            admin_page.screenshot(path=str(TMP / f"slack_debug_{email.split('@')[0]}.png"))
+            browser.close()
+            return False
+
+        search.fill(email)
+        admin_page.wait_for_timeout(5000)
+
+        # ── Hover over row to reveal action button ────────────────────────
+        name_cell = admin_page.query_selector(
+            '[data-qa-column="workspace-members_table_real_name"]'
+        )
+        if name_cell:
+            box = name_cell.bounding_box()
+            if box:
+                admin_page.mouse.move(
+                    box["x"] + box["width"] / 2,
+                    box["y"] + box["height"] / 2,
+                )
+                admin_page.wait_for_timeout(1500)
+
+        # ── Click the '...' row action button ─────────────────────────────
+        action_btn = admin_page.query_selector('[data-qa="table_row_actions_button"]')
+        if not action_btn:
+            log.error(f"  [Slack] Could not find row action button for {email}")
+            admin_page.screenshot(path=str(TMP / f"slack_debug_{email.split('@')[0]}.png"))
+            browser.close()
+            return False
+
+        action_btn.click()
+        admin_page.wait_for_timeout(2000)
+
+        # ── Click 'Activate account' from the dropdown ────────────────────
+        activate_btn = None
+        for el in admin_page.query_selector_all("button, [role='menuitem'], li"):
+            txt = el.inner_text().strip().lower()
+            if "activate account" in txt or txt == "activate" or "reactivate" in txt:
+                activate_btn = el
+                break
+        if not activate_btn:
+            log.error(f"  [Slack] Could not find Activate button for {email}")
+            admin_page.screenshot(path=str(TMP / f"slack_debug_{email.split('@')[0]}.png"))
+            browser.close()
+            return False
+
+        activate_btn.click()
+        admin_page.wait_for_timeout(2000)
+
+        # ── Handle confirmation modal (radio → Save) ──────────────────────
+        radio = admin_page.query_selector('input[type="radio"]')
+        if radio:
+            radio.click()
+            admin_page.wait_for_timeout(500)
+
+        save_btn = (
+            admin_page.query_selector('[data-qa="activate_confirm_button"]')
+            or admin_page.query_selector('[data-qa="reactivate_confirm_button"]')
+            or admin_page.query_selector('[data-qa="save_button"]')
+        )
+        if not save_btn:
+            for btn in admin_page.query_selector_all("button"):
+                txt = btn.inner_text().strip().lower()
+                if txt == "save":
+                    save_btn = btn
+                    break
+        if not save_btn:
+            for btn in admin_page.query_selector_all("button"):
+                txt = btn.inner_text().strip().lower()
+                if txt in ("confirm", "activate", "reactivate", "yes"):
+                    save_btn = btn
+                    break
+        if not save_btn:
+            log.error(f"  [Slack] Could not find Save button for {email}")
+            admin_page.screenshot(path=str(TMP / f"slack_no_save_{email.split('@')[0]}.png"))
+            browser.close()
+            return False
+
+        save_btn.click()
+        admin_page.wait_for_timeout(2000)
+        log.info(f"  [Slack] Reactivated via Playwright: {email}")
+        browser.close()
+        return True
+
+
+def slack_reactivate_playwright(email: str, log, max_retries: int = 3) -> bool:
+    """Reactivate a deactivated Slack member with automatic retry."""
+    from slack_auth import SESSION_FILE as _SESSION_FILE
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            log.info(f"  [Slack] Reactivation attempt {attempt}/{max_retries} for {email}")
+            if _slack_reactivate_single(email, log):
+                return True
+        except Exception as e:
+            log.error(f"  [Slack] Reactivation error for {email} (attempt {attempt}): {e}")
+        if attempt < max_retries:
+            log.info("  [Slack] Clearing session and retrying...")
+            _SESSION_FILE.unlink(missing_ok=True)
+
+    log.error(f"  [Slack] All {max_retries} reactivation attempts failed for {email}")
+    return False
 
 
 def handle_slack(email: str, log):
@@ -915,7 +789,22 @@ def main():
     log = logging.getLogger(__name__)
     log.info("=" * 60)
     log.info("SEAL challenge processing - run started")
+    set_live("checking", "Scanning challenge sheet")
+    log_run_start("process_challenge")
 
+    rl = RunLogger("process_challenge", log)
+    rl.__enter__()
+    try:
+        _run_challenge(log, rl)
+    except Exception as exc:
+        import traceback
+        rl.log_error("UNKNOWN", str(exc), traceback.format_exc())
+        raise
+    finally:
+        rl.__exit__(None, None, None)
+
+
+def _run_challenge(log, rl):
     # Load config
     with open(CONFIG, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -935,8 +824,8 @@ def main():
     # Build API clients — reuse same token files as process_applicants.py
     gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, hint="sealdirector@gmail.com")
     admin_creds = get_credentials(SCOPES_ADMIN, TOKEN_ADMIN, hint="admin@maxalton.com")
-    sheets_svc  = build("sheets", "v4", credentials=gmail_creds)
-    admin_svc   = build("admin", "directory_v1", credentials=admin_creds)
+    sheets_svc  = build("sheets", "v4", http=AuthorizedHttp(gmail_creds, http=make_http()))
+    admin_svc   = build("admin", "directory_v1", http=AuthorizedHttp(admin_creds, http=make_http()))
 
     # Read source data
     all_rows = get_sheet_data(sheets_svc, challenge_sid, applicants_tab)
@@ -973,33 +862,50 @@ def main():
     log.info(f"Stage 3 rows found: {len(new_rows)}")
 
     # ── Dedup: classify rows by how far they got in a previous run ────────────
-    # "Added to SEAL Life" is the commit marker — written last so it is only
-    # present when all prior steps (Associates, Group, Slack) completed.
-    # If a row is in Associates but NOT in Added to SEAL Life, it means the
-    # script crashed mid-run; the resume path below picks it up cleanly.
+    # Dedup: only Associates matters — if the email is already there, skip.
+    # "Added to SEAL Life" is record-keeping only; it does NOT block processing.
     already_committed     = get_emails_in_tab(sheets_svc, challenge_sid, added_tab, email_col)
     already_in_associates = get_emails_in_tab(sheets_svc, clan_sid, associates_tab, email_col)
 
-    skip_rows    = []  # fully committed — nothing to do except delete from Applicants
-    partial_rows = []  # in Associates but not yet committed — resume from group add
-    full_rows    = []  # in neither destination — full processing required
+    skip_rows    = []  # already in Associates — nothing to do except delete from Applicants
+    full_rows    = []  # not in Associates — full processing required
 
     for item in new_rows:
         i, row, email = item
-        if email.lower() in already_committed:
-            log.info(f"SKIP     {email}  (already in '{added_tab}')")
+        if email.lower() in already_in_associates:
+            log.info(f"SKIP     {email}  (already in Associates — no action needed)")
             skip_rows.append(item)
-        elif email.lower() in already_in_associates:
-            log.info(f"RESUME   {email}  (in Associates, not yet committed — resuming)")
-            partial_rows.append(item)
         else:
+            # Not in Associates yet — full processing required.
+            # "Added to SEAL Life" is record-keeping only; it does NOT block processing.
+            if email.lower() in already_committed:
+                log.info(f"PROCESS  {email}  (in '{added_tab}' for record-keeping, but not in Associates)")
             full_rows.append(item)
 
     log.info(
-        f"Categorised: {len(full_rows)} full | {len(partial_rows)} resume | {len(skip_rows)} skip"
+        f"Categorised: {len(full_rows)} to process | {len(skip_rows)} skip (already in Associates)"
     )
 
     STAGE_COL = 15  # column P
+    committed_indices = set()   # track rows whose commit marker was verified
+    failed_indices = set()      # track rows that failed verification
+
+    def _verify_write(svc, sid, tab, start_row, count, label):
+        """Read back after write; return True if verified.
+        Uses a wide range (A:AP) since column A may be empty in some rows."""
+        verify = svc.spreadsheets().values().get(
+            spreadsheetId=sid,
+            range=f"'{tab}'!A{start_row}:AP{start_row + count - 1}"
+        ).execute()
+        written = verify.get("values", [])
+        if len(written) != count:
+            log.error(
+                f"  [Sheets] VERIFY FAILED ({label}): expected {count} row(s) at "
+                f"'{tab}' rows {start_row}-{start_row + count - 1}, but read back {len(written)}"
+            )
+            return False
+        log.info(f"  [Sheets] Verified {count} row(s) for {label}")
+        return True
 
     # ── Full processing ───────────────────────────────────────────────────────
     # Order: Associates → Group → Slack → Added to SEAL Life (commit marker last).
@@ -1022,30 +928,39 @@ def main():
                               log=log)
 
         # 2. Group + Slack (per-email)
-        for _, _, email in full_rows:
+        for _, row, email in full_rows:
+            set_live("adding", "Adding to group + Slack", email=email, step="group")
             add_to_google_group(admin_svc, active_group, email, log)
+            set_live("adding", "Inviting to Slack", email=email, step="slack")
             handle_slack(email, log)
+            log_event("add", email, "STAGE3_ADDED")
+            # Extract name from row for notes (column index 1 is typically the name)
+            row_name = row[1].strip() if len(row) > 1 else ""
+            rl.add_note(f"STAGE 3 → Associates: {row_name} ({email})")
 
         # 3. Added to SEAL Life — commit marker, written last
         added_next_row = find_next_blank_row(sheets_svc, challenge_sid, added_tab, 1)
         copy_rows_with_formatting(sheets_svc, challenge_sid, applicants_tab, src_indices,
                                   challenge_sid, added_tab, added_next_row, [], log)
 
-    # ── Partial resume ────────────────────────────────────────────────────────
-    # Associates row already exists — skip that write, redo group add + Slack,
-    # then write the commit marker.
-    for i, row, email in partial_rows:
-        log.info(f"  Resuming partial for {email}")
-        add_to_google_group(admin_svc, active_group, email, log)
-        handle_slack(email, log)
-        added_next_row = find_next_blank_row(sheets_svc, challenge_sid, added_tab, 1)
-        copy_rows_with_formatting(sheets_svc, challenge_sid, applicants_tab, [i],
-                                  challenge_sid, added_tab, added_next_row, [], log)
+        # Verify commit marker
+        if _verify_write(sheets_svc, challenge_sid, added_tab, added_next_row, len(full_rows), "commit marker"):
+            committed_indices.update(src_indices)
+        else:
+            failed_indices.update(src_indices)
 
-    # ── Delete all processed rows from Applicants ─────────────────────────────
-    # Covers full, resume, and skip categories.  Deletion can fail if the tab
-    # has protected ranges — the dedup above ensures re-runs are safe regardless.
-    rows_to_delete = [i for i, _, _ in (skip_rows + partial_rows + full_rows)]
+    # ── Delete processed rows from Applicants ─────────────────────────────────
+    # Only delete rows whose Associates write was verified (tracked via commit
+    # marker verification), plus skip rows (already in Associates).
+    # Never delete rows that failed verification.
+    safe_to_delete = [i for i, _, _ in skip_rows]  # already in Associates
+    safe_to_delete += [i for i in committed_indices]
+    if failed_indices:
+        log.error(
+            f"  [Sheets] {len(failed_indices)} row(s) NOT deleted — commit marker "
+            f"verification failed. Will retry on next run."
+        )
+    rows_to_delete = safe_to_delete
     if rows_to_delete:
         try:
             delete_rows(sheets_svc, challenge_sid, applicants_tab, rows_to_delete, log)
@@ -1054,6 +969,19 @@ def main():
                 f"  [Sheets] Could not delete rows from '{applicants_tab}' (protected?): {e.reason}"
             )
 
+    if not new_rows:
+        log_run_msg("No stage 3 applicants found")
+        log_result("empty")
+        rl.set_rows_processed("0 stage 3")
+    else:
+        log_run_msg(f"Challenge: {len(full_rows)} processed, {len(skip_rows)} skipped")
+        log_result("processed")
+        rl.set_rows_processed(f"{len(full_rows)} processed, {len(skip_rows)} skipped")
+        if full_rows:
+            rl.add_action(f"{len(full_rows)} added to Associates + Group + Slack")
+        if failed_indices:
+            rl.log_error("SHEET_003", f"{len(failed_indices)} commit marker verification(s) failed")
+    set_live("idle", "Challenge processing complete")
     log.info("Run complete.")
 
 

@@ -21,13 +21,14 @@ Run hourly via Windows Task Scheduler alongside `process_applicants.py`.
 ## Processing Logic
 1. Read all rows from the **Applicants** tab
 2. Skip rows where column P does not equal "stage 3" (case-insensitive)
-3. Skip rows whose column AP email already appears in "Added to SEAL Life" (deduplication)
+3. Skip rows whose column AP email already appears in **Associates** (deduplication)
+   - "Added to SEAL Life" is record-keeping only — it does NOT block processing
 4. For each new qualifying row:
-   - Append to **Added to SEAL Life** tab
-   - Append to **Associates** tab in SEAL Clan Life
+   - Copy to **Associates** tab in SEAL Clan Life (with formatting, verified)
    - Add email to **seal-active@maxalton.com** via Admin SDK
    - Handle Slack membership (see Slack section below)
-5. Delete the processed row from the **Applicants** tab
+   - Copy to **Added to SEAL Life** tab (record-keeping, verified)
+5. Delete the processed row from the **Applicants** tab (only if writes verified)
 
 ## Authentication
 Reuses the same token files as `process_applicants.py`:

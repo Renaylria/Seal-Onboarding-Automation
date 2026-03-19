@@ -141,3 +141,9 @@ clan_cleanup:
 
   # Google Workspace group to remove GameOver and Ex-Associate members from
   active_group_email: "seal-active@maxalton.com"
+
+# ── Automation Log ──────────────────────────────────────────────────────────
+# Google Sheet used by run_logger.py to track all script runs and errors.
+# Owned by sealdirector@gmail.com.
+automation_log:
+  sheet_id: "1KS6JXbZVw3sSOQV17iNTtWdALLLueWJIHWeA5jCdX7Y"
