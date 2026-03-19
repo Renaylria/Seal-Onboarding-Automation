@@ -17,6 +17,7 @@ Run:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -41,8 +42,9 @@ CONFIG      = ROOT / "config.yaml"
 TOKEN_GMAIL = ROOT / "token_gmail.json"   # sealdirector@gmail.com — Sheets access
 TOKEN_ADMIN = ROOT / "token_admin.json"   # admin@maxalton.com     — Group management
 CREDS       = ROOT / "credentials.json"
-TMP         = ROOT / ".tmp"
-LOG_FILE    = TMP / "process_clan_cleanup.log"
+TMP                    = ROOT / ".tmp"
+LOG_FILE               = TMP / "process_clan_cleanup.log"
+PENDING_DEACTIVATE_FILE = TMP / "slack_deactivate_pending.json"
 
 # ── OAuth Scopes ───────────────────────────────────────────────────────────────
 SCOPES_GMAIL = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -574,7 +576,8 @@ def slack_deactivate_playwright(email: str, log: logging.Logger) -> bool:
                     "button, [role='menuitem'], li"
                 ):
                     txt = el.inner_text().strip().lower()
-                    if "deactivate account" in txt or txt == "deactivate":
+                    if ("deactivate account" in txt or txt == "deactivate"
+                            or "revoke invitation" in txt):
                         deactivate_btn = el
                         break
 
@@ -603,7 +606,7 @@ def slack_deactivate_playwright(email: str, log: logging.Logger) -> bool:
                 for btn in admin_page.query_selector_all("button"):
                     txt = btn.inner_text().strip().lower()
                     if txt in ("deactivate", "deactivate account", "confirm",
-                               "yes", "remove"):
+                               "yes", "remove", "revoke", "revoke invitation"):
                         confirm_btn = btn
                         break
 
@@ -622,13 +625,45 @@ def slack_deactivate_playwright(email: str, log: logging.Logger) -> bool:
             confirm_btn.click()
             admin_page.wait_for_timeout(2000)
 
-            log.info("  [Slack] Deactivated via Playwright: %s", email)
+            log.info("  [Slack] Removed from workspace via Playwright: %s", email)
             browser.close()
             return True
 
     except Exception as exc:
         log.error("  [Slack] Playwright deactivation failed for %s: %s", email, exc)
         return False
+
+
+def load_pending_deactivations() -> list[str]:
+    """Return emails that failed Slack deactivation in a previous run."""
+    if not PENDING_DEACTIVATE_FILE.exists():
+        return []
+    try:
+        data = json.loads(PENDING_DEACTIVATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_pending_deactivations(emails: list[str]) -> None:
+    """Persist the pending deactivation list to disk."""
+    TMP.mkdir(parents=True, exist_ok=True)
+    PENDING_DEACTIVATE_FILE.write_text(json.dumps(emails, indent=2), encoding="utf-8")
+
+
+def add_pending_deactivation(email: str) -> None:
+    """Queue an email for retry on the next run (deduplicates)."""
+    pending = load_pending_deactivations()
+    if email.lower() not in [e.lower() for e in pending]:
+        pending.append(email)
+    save_pending_deactivations(pending)
+
+
+def remove_pending_deactivation(email: str) -> None:
+    """Remove a successfully deactivated email from the retry queue."""
+    pending = load_pending_deactivations()
+    pending = [e for e in pending if e.lower() != email.lower()]
+    save_pending_deactivations(pending)
 
 
 def handle_slack_deactivate(email: str, log: logging.Logger) -> None:
@@ -661,7 +696,16 @@ def handle_slack_deactivate(email: str, log: logging.Logger) -> None:
     # User is active — deactivate
     log.info("  [Slack] Deactivating active account for %s", email)
     if not slack_deactivate_api(user_id, log):
-        slack_deactivate_playwright(email, log)
+        success = slack_deactivate_playwright(email, log)
+        if success:
+            remove_pending_deactivation(email)
+        else:
+            log.warning(
+                "  [Slack] Deactivation failed for %s — queued for retry next run", email
+            )
+            add_pending_deactivation(email)
+    else:
+        remove_pending_deactivation(email)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -696,6 +740,33 @@ def main() -> None:
     log.info("Authenticating (Admin SDK)…")
     admin_creds = get_credentials(SCOPES_ADMIN, TOKEN_ADMIN, "admin@maxalton.com")
     admin_svc   = build("admin", "directory_v1", credentials=admin_creds)
+
+    # ── Retry previously failed Slack deactivations ───────────────────────────
+    pending = load_pending_deactivations()
+    if pending:
+        log.info("Retrying %d previously failed Slack deactivation(s)…", len(pending))
+        for email in list(pending):
+            log.info("  Retrying: %s", email)
+            user_id, is_deactivated = slack_lookup_user(email, log)
+            if user_id is None:
+                log.info(
+                    "  [Slack] %s no longer in workspace — removing from retry queue", email
+                )
+                remove_pending_deactivation(email)
+            elif is_deactivated:
+                log.info(
+                    "  [Slack] %s is already deactivated — removing from retry queue", email
+                )
+                remove_pending_deactivation(email)
+            else:
+                success = slack_deactivate_playwright(email, log)
+                if success:
+                    log.info("  [Slack] Retry succeeded for %s", email)
+                    remove_pending_deactivation(email)
+                else:
+                    log.warning(
+                        "  [Slack] Retry failed again for %s — will try next run", email
+                    )
 
     # ── Read Associates tab ───────────────────────────────────────────────────
     log.info("Reading Associates tab from SEAL Clan Life sheet…")

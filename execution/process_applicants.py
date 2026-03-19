@@ -24,6 +24,15 @@ from email.message import EmailMessage
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+
+def col_to_letter(n: int) -> str:
+    """Convert a 0-based column index to a spreadsheet column letter (A, B, …, Z, AA, AB, …)."""
+    result, n = "", n + 1
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
 import yaml
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -108,31 +117,40 @@ def ensure_tab_exists(svc, spreadsheet_id: str, tab: str, header: list | None = 
             ).execute()
 
 
-def append_rows(svc, spreadsheet_id: str, tab: str, rows: list):
-    """Append rows to a tab, inserting new rows below existing content."""
-    svc.spreadsheets().values().append(
+def write_to_next_blank_row(svc, spreadsheet_id: str, tab: str, rows: list,
+                            start_row: int, log) -> int:
+    """Write rows to the first blank row in column A at or below start_row (1-indexed).
+
+    Uses values().update() with an explicit A{row} range instead of values().append()
+    so the destination is always column A — append() can place data to the right of
+    an existing table when the sheet has wide data in other columns.
+
+    Returns the 1-indexed row number where writing began.
+    """
+    result = svc.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"'{tab}'",
+        range=f"'{tab}'!A:A"
+    ).execute()
+    col_a = result.get("values", [])
+
+    next_row = start_row  # default: use start_row if everything is blank
+    for i in range(start_row - 1, len(col_a)):
+        if not col_a[i] or not str(col_a[i][0]).strip():
+            next_row = i + 1   # 1-indexed
+            break
+    else:
+        # All rows from start_row downward have data — write after last
+        next_row = max(len(col_a) + 1, start_row)
+
+    svc.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{tab}'!A{next_row}",
         valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
         body={"values": rows}
     ).execute()
+    log.info(f"  [Sheets] Wrote {len(rows)} row(s) to '{tab}' starting at row {next_row}")
+    return next_row
 
-
-def ensure_min_empty_rows(svc, spreadsheet_id: str, tab: str, num_cols: int, min_empty: int):
-    """Guarantee at least min_empty blank rows at the bottom of a tab."""
-    data = get_sheet_data(svc, spreadsheet_id, tab)
-
-    # Count trailing empty rows
-    trailing = 0
-    for row in reversed(data):
-        if any(str(c).strip() for c in row):
-            break
-        trailing += 1
-
-    needed = min_empty - trailing
-    if needed > 0:
-        append_rows(svc, spreadsheet_id, tab, [[""] * num_cols for _ in range(needed)])
 
 
 def get_emails_in_tab(svc, spreadsheet_id: str, tab: str, email_col: int) -> set:
@@ -204,7 +222,11 @@ def send_email(gmail_svc, sender: str, recipient: str, name: str,
     """
     actual_to = test_override if test_override else recipient
     try:
-        body = body_template.format(name=name or recipient, email=recipient)
+        class SafeDict(dict):
+            """Return unknown keys unchanged so stray braces in user data never crash."""
+            def __missing__(self, key):
+                return "{" + key + "}"
+        body = body_template.format_map(SafeDict(name=name or recipient, email=recipient))
         msg = EmailMessage()
         msg["To"] = actual_to
         msg["From"] = sender
@@ -224,7 +246,8 @@ def send_email(gmail_svc, sender: str, recipient: str, name: str,
 
 def get_rows_needing_email(svc, spreadsheet_id: str, tab: str,
                            email_col: int, name_col: int,
-                           email_sent_col: int) -> list:
+                           email_sent_col: int,
+                           whitelist: set | None = None) -> list:
     """Return rows in a tab that have not yet had an email sent.
 
     Scans every data row (skipping the header) and returns those where
@@ -239,6 +262,9 @@ def get_rows_needing_email(svc, spreadsheet_id: str, tab: str,
         email_col:      0-based column index for email address.
         name_col:       0-based column index for recipient name.
         email_sent_col: 0-based column index for the "Email Sent" marker (column O).
+        whitelist:      When non-empty, only rows whose email (lowercased) is in this
+                        set are returned. Non-whitelisted rows are left untouched
+                        (column O stays blank) until the whitelist is cleared.
 
     Returns:
         List of (row_number_1indexed, email, name) tuples — one per unsent row.
@@ -262,35 +288,44 @@ def get_rows_needing_email(svc, spreadsheet_id: str, tab: str,
         sent = row[email_sent_col].strip() if len(row) > email_sent_col else ""
         if sent:
             continue
+        # Enforce whitelist when active
+        if whitelist and email.lower() not in whitelist:
+            continue
         name = row[name_col].strip() if len(row) > name_col else ""
         result.append((row_number, email, name))
     return result
 
 
-def mark_email_sent(svc, spreadsheet_id: str, tab: str,
-                    row_number: int, email_sent_col: int, log):
-    """Write a sent timestamp to column O of a specific data row.
+def batch_mark_emails_sent(svc, spreadsheet_id: str,
+                           marks: list, email_sent_col: int, log):
+    """Write sent timestamps to column O for all successfully sent emails in one API call.
+
+    Batching all writes into a single batchUpdate avoids the Sheets API
+    write-quota limit (60 writes/minute) that fires when marking rows individually.
 
     Args:
         svc:            Authenticated Sheets API client.
         spreadsheet_id: Google Sheet ID.
-        tab:            Tab name (e.g. "Approved").
-        row_number:     1-indexed row number in the sheet.
+        marks:          List of (tab, row_number_1indexed) tuples to mark.
         email_sent_col: 0-based column index to write into (column O = 14).
         log:            Logger instance.
     """
-    col_letter = chr(ord('A') + email_sent_col)   # 14 -> 'O'
-    cell = f"'{tab}'!{col_letter}{row_number}"
+    if not marks:
+        return
+    col_letter = col_to_letter(email_sent_col)
     timestamp = datetime.now().strftime("Sent %Y-%m-%d %H:%M")
+    data = [
+        {"range": f"'{tab}'!{col_letter}{row_number}", "values": [[timestamp]]}
+        for tab, row_number in marks
+    ]
     try:
-        svc.spreadsheets().values().update(
+        svc.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
-            range=cell,
-            valueInputOption="USER_ENTERED",
-            body={"values": [[timestamp]]}
+            body={"valueInputOption": "USER_ENTERED", "data": data}
         ).execute()
+        log.info(f"  [Sheets] Marked {len(marks)} row(s) as email sent in column {col_letter}")
     except Exception as e:
-        log.error(f"  [Sheets] Failed to mark email sent at {cell}: {e}")
+        log.error(f"  [Sheets] Failed to batch-mark email sent: {e}")
 
 
 def ensure_column_header(svc, spreadsheet_id: str, tab: str,
@@ -312,7 +347,7 @@ def ensure_column_header(svc, spreadsheet_id: str, tab: str,
     header_row = data[0] if data else []
     current = header_row[col_idx].strip() if len(header_row) > col_idx else ""
     if not current:
-        col_letter = chr(ord('A') + col_idx)
+        col_letter = col_to_letter(col_idx)
         cell = f"'{tab}'!{col_letter}1"
         svc.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
@@ -354,15 +389,22 @@ def main():
     status_col       = s["status_column_index"]
     name_col         = s["name_column_index"]
     email_sent_col   = s["email_sent_column_index"]
-    min_empty        = s["min_empty_rows"]
+    start_row        = s["start_row"]
     keywords         = cfg["rejection_keywords"]
     group_email      = cfg["google_group"]["email"]
     email_cfg        = cfg["email"]
     rejection_email_cfg = cfg["rejection_email"]
     test_override    = cfg.get("testing", {}).get("test_email_override", "").strip()
+    test_whitelist   = {
+        e.strip().lower()
+        for e in cfg.get("testing", {}).get("test_whitelist", [])
+        if e.strip()
+    }
 
     if test_override:
         log.info(f"TEST MODE: all outgoing emails will be sent to {test_override}")
+    if test_whitelist:
+        log.info(f"TEST WHITELIST active: emails will only be sent to {sorted(test_whitelist)}")
 
     # Build API clients — two separate auth accounts
     gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, hint="sealdirector@gmail.com")
@@ -379,7 +421,6 @@ def main():
 
     header    = all_rows[0]
     data_rows = all_rows[1:]
-    num_cols  = len(header)
 
     # Collect already-processed emails (deduplication)
     processed = (
@@ -421,7 +462,7 @@ def main():
         status = padded[status_col].strip()
         name   = padded[name_col].strip() if len(padded) > name_col else ""
 
-        if is_rejected(status, keywords):
+        if not status or is_rejected(status, keywords):
             new_rejected.append((row, email, name))
             log.info(f"REJECTED  {email}  (status='{status}')")
         else:
@@ -431,44 +472,54 @@ def main():
     log.info(f"New this run -> approved: {len(new_approved)}, rejected: {len(new_rejected)}")
 
     # ── Write new rows to destination tabs ────────────────────────────────────
+    # Strip column O from source rows before writing — source rows may carry
+    # a non-blank column O value (e.g. from a previous backfill run), which
+    # would make the email scanner think the email was already sent.
+    def clear_col(rows, col_idx):
+        result = []
+        for r in rows:
+            r = list(r)
+            if len(r) > col_idx:
+                r[col_idx] = ""
+            result.append(r)
+        return result
+
     if new_approved:
-        append_rows(sheets_svc, sid, approved_tab, [r for r, _, _ in new_approved])
-        log.info(f"  [Sheets] Appended {len(new_approved)} row(s) to '{approved_tab}'")
+        write_to_next_blank_row(sheets_svc, sid, approved_tab,
+                                clear_col([r for r, _, _ in new_approved], email_sent_col),
+                                start_row, log)
         for _, email, name in new_approved:
             add_to_google_group(admin_svc, group_email, email, log)
 
     if new_rejected:
-        append_rows(sheets_svc, sid, rejected_tab, [r for r, _, _ in new_rejected])
-        log.info(f"  [Sheets] Appended {len(new_rejected)} row(s) to '{rejected_tab}'")
+        write_to_next_blank_row(sheets_svc, sid, rejected_tab,
+                                clear_col([r for r, _, _ in new_rejected], email_sent_col),
+                                start_row, log)
 
     # ── Send emails: scan both tabs for rows with blank column O ───────────────
     # This handles both rows just appended this run AND any historical rows that
     # were added before the email feature existed (self-healing backfill).
-    # Column O is only written after a successful send, so a failed send is
-    # automatically retried on the next run.
+    # All column O marks are batched into a single API call per tab to stay
+    # within the Sheets write-quota limit (60 writes/minute).
     for tab, subject, body in [
         (approved_tab,  email_cfg["subject"],            email_cfg["body"]),
         (rejected_tab,  rejection_email_cfg["subject"],  rejection_email_cfg["body"]),
     ]:
         pending = get_rows_needing_email(
-            sheets_svc, sid, tab, email_col, name_col, email_sent_col
+            sheets_svc, sid, tab, email_col, name_col, email_sent_col,
+            whitelist=test_whitelist or None
         )
         if pending:
             log.info(f"  [Email] {len(pending)} unsent row(s) found in '{tab}'")
+        marks = []
         for row_number, email, name in pending:
             sent = send_email(
                 gmail_svc, email_cfg["sender"], email, name,
                 subject, body, log, test_override=test_override
             )
             if sent:
-                mark_email_sent(sheets_svc, sid, tab, row_number, email_sent_col, log)
-
-    # ── Maintain 10 empty rows in both tabs ────────────────────────────────────
-    for tab in [approved_tab, rejected_tab]:
-        try:
-            ensure_min_empty_rows(sheets_svc, sid, tab, num_cols, min_empty)
-        except Exception as e:
-            log.error(f"Failed to pad empty rows in '{tab}': {e}")
+                marks.append((tab, row_number))
+        batch_mark_emails_sent(sheets_svc, sid, marks, email_sent_col, log)
 
     log.info("Run complete.")
 

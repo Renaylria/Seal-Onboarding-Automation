@@ -4,17 +4,20 @@ process_challenge.py — SEAL Applicant Challenge Stage 3 Processing
 
 Monitors the 'Applicants' tab of the SEAL Applicant Challenge sheet for rows
 where column P equals "stage 3". For each newly qualifying row:
-  1. Copies the row to the 'Added to SEAL Life' tab (same sheet)
-  2. Copies the row to the 'Associates' tab of the SEAL Clan Life sheet
-  3. Adds the email (column AP) to the seal-active@maxalton.com Workspace group
-  4. Handles Slack membership:
-       - New members   → sends a workspace invite via users.admin.invite
+  1. Copies the row to the 'Associates' tab of the SEAL Clan Life sheet
+  2. Adds the email (column AP) to the seal-active@maxalton.com Workspace group
+  3. Handles Slack membership:
+       - New members   → sends a workspace invite via the admin panel GUI
        - Returning members (deactivated account) → reactivates via API,
          falling back to Playwright GUI automation if the API is unavailable
+  4. Copies the row to the 'Added to SEAL Life' tab (commit marker — written last)
   5. Deletes the processed row from the Applicants tab
 
-Deduplication: emails already present in 'Added to SEAL Life' are skipped,
-ensuring no row is processed more than once across runs.
+Deduplication uses a two-phase check against both destination tabs:
+  - Email in 'Added to SEAL Life'           → fully committed, skip all steps
+  - Email in Associates but NOT in commit tab → partial failure; resume from step 2
+  - Email in neither                         → full processing
+This makes every re-run safe and idempotent even after a mid-run crash.
 
 Requires in .env:
     SLACK_USER_TOKEN     — xoxp- user token with admin, users:read, users:read.email scopes
@@ -25,6 +28,7 @@ Usage:
     python execution/process_challenge.py
 """
 
+import copy
 import os
 import re
 import sys
@@ -163,6 +167,103 @@ def write_to_next_blank_row(svc, spreadsheet_id: str, tab: str, rows: list,
     return next_row
 
 
+def find_next_blank_row(svc, spreadsheet_id: str, tab: str, start_row: int) -> int:
+    """Return the 1-indexed first blank row in column A at or below start_row."""
+    result = svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{tab}'!A:A"
+    ).execute()
+    col_a = result.get("values", [])
+    for i in range(start_row - 1, len(col_a)):
+        if not col_a[i] or not str(col_a[i][0]).strip():
+            return i + 1
+    return max(len(col_a) + 1, start_row)
+
+
+def copy_rows_with_formatting(svc, src_sid: str, src_tab: str,
+                               src_row_indices: list,
+                               dst_sid: str, dst_tab: str,
+                               dst_start_row: int,
+                               blank_cols: list,
+                               log) -> None:
+    """Copy rows from src to dst preserving all formatting and hyperlinks.
+
+    Uses spreadsheets.get(includeGridData=True) to read full CellData —
+    this captures fonts, colours, alignment, and both formula-based and
+    rich-text hyperlinks that values().get() silently drops.
+
+    Writes via updateCells so formatting is applied cell-by-cell in the
+    destination rather than overwriting the entire sheet.
+
+    blank_cols: 0-based column indices to clear in each copied row
+                (e.g. [15] to blank column P before formula propagation).
+    """
+    # ── 1. Read source rows with full cell data ────────────────────────────
+    src_result = svc.spreadsheets().get(
+        spreadsheetId=src_sid,
+        ranges=[f"'{src_tab}'"],
+        includeGridData=True,
+        fields="sheets.data.rowData,sheets.properties.title"
+    ).execute()
+
+    all_row_data = []
+    for sheet in src_result.get("sheets", []):
+        if sheet["properties"]["title"] == src_tab:
+            all_row_data = sheet["data"][0].get("rowData", [])
+            break
+
+    # ── 2. Extract requested rows and blank specified columns ──────────────
+    rows_to_write = []
+    for idx in src_row_indices:
+        rd = copy.deepcopy(all_row_data[idx]) if idx < len(all_row_data) else {}
+        cells = rd.get("values", [])
+        for col in blank_cols:
+            if col < len(cells):
+                cells[col] = {}   # empty CellData clears the cell
+        rd["values"] = cells
+        rows_to_write.append(rd)
+
+    # ── 3. Write to destination with full formatting ───────────────────────
+    # Get sheetId and columnCount together to avoid an extra API call.
+    # columnCount is used to trim source rows that are wider than the
+    # destination sheet (updateCells rejects writes beyond the last column).
+    dst_meta = svc.spreadsheets().get(spreadsheetId=dst_sid).execute()
+    dst_sheet_id = None
+    dst_col_count = None
+    for s in dst_meta["sheets"]:
+        if s["properties"]["title"] == dst_tab:
+            dst_sheet_id = s["properties"]["sheetId"]
+            dst_col_count = s["properties"]["gridProperties"]["columnCount"]
+            break
+    if dst_sheet_id is None:
+        raise ValueError(f"Tab '{dst_tab}' not found in spreadsheet {dst_sid}")
+
+    # Trim each row to the destination column count
+    for rd in rows_to_write:
+        rd["values"] = rd.get("values", [])[:dst_col_count]
+
+    requests = [
+        {
+            "updateCells": {
+                "rows": [rd],
+                "fields": "userEnteredValue,userEnteredFormat,textFormatRuns",
+                "start": {
+                    "sheetId": dst_sheet_id,
+                    "rowIndex": dst_start_row - 1 + i,   # 0-indexed
+                    "columnIndex": 0
+                }
+            }
+        }
+        for i, rd in enumerate(rows_to_write)
+    ]
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=dst_sid,
+        body={"requests": requests}
+    ).execute()
+    log.info(f"  [Sheets] Copied {len(rows_to_write)} row(s) with formatting "
+             f"to '{dst_tab}' starting at row {dst_start_row}")
+
+
 def copy_formula_down(svc, spreadsheet_id: str, tab: str,
                       source_row: int, dest_start_row: int,
                       num_rows: int, col_idx: int, log):
@@ -189,7 +290,7 @@ def copy_formula_down(svc, spreadsheet_id: str, tab: str,
             "pasteType": "PASTE_FORMULA"
         }}]}
     ).execute()
-    log.info(f"  [Sheets] Copied column P formula from row {source_row} → rows {dest_start_row}-{dest_start_row + num_rows - 1}")
+    log.info(f"  [Sheets] Copied column P formula from row {source_row} -> rows {dest_start_row}-{dest_start_row + num_rows - 1}")
 
 
 def get_sheet_id(svc, spreadsheet_id: str, tab: str) -> int:
@@ -851,8 +952,7 @@ def main():
     ensure_tab_exists(sheets_svc, challenge_sid, added_tab, header)
     ensure_tab_exists(sheets_svc, clan_sid, associates_tab, header)
 
-    # Find all stage 3 rows — deletion after processing is the dedup mechanism.
-    # Students may reapply, so no email-based dedup is applied here.
+    # Find all stage 3 rows
     new_rows = []
 
     for i, row in enumerate(all_rows):
@@ -870,50 +970,89 @@ def main():
         new_rows.append((i, row, email))
         log.info(f"STAGE 3   {email}")
 
-    log.info(f"New stage 3 rows this run: {len(new_rows)}")
+    log.info(f"Stage 3 rows found: {len(new_rows)}")
 
-    # Process each qualifying row
-    if new_rows:
-        rows_only = [r for _, r, _ in new_rows]
+    # ── Dedup: classify rows by how far they got in a previous run ────────────
+    # "Added to SEAL Life" is the commit marker — written last so it is only
+    # present when all prior steps (Associates, Group, Slack) completed.
+    # If a row is in Associates but NOT in Added to SEAL Life, it means the
+    # script crashed mid-run; the resume path below picks it up cleanly.
+    already_committed     = get_emails_in_tab(sheets_svc, challenge_sid, added_tab, email_col)
+    already_in_associates = get_emails_in_tab(sheets_svc, clan_sid, associates_tab, email_col)
 
-        # 1. Copy to 'Added to SEAL Life' (same sheet)
-        append_rows(sheets_svc, challenge_sid, added_tab, rows_only)
-        log.info(f"  [Sheets] Copied {len(rows_only)} row(s) to '{added_tab}'")
+    skip_rows    = []  # fully committed — nothing to do except delete from Applicants
+    partial_rows = []  # in Associates but not yet committed — resume from group add
+    full_rows    = []  # in neither destination — full processing required
 
-        # 2. Write to next blank row in 'Associates' in SEAL Clan Life sheet.
-        #    Column P (index 15) is blanked — formula is copied from the row above instead.
-        STAGE_COL = 15  # column P
-        associates_rows = [
-            r[:STAGE_COL] + [""] + r[STAGE_COL + 1:] if len(r) > STAGE_COL else r
-            for r in rows_only
-        ]
-        dest_row = write_to_next_blank_row(sheets_svc, clan_sid, associates_tab,
-                                           associates_rows, associates_start, log)
-        # Copy the column P formula from the row above into each newly written row
+    for item in new_rows:
+        i, row, email = item
+        if email.lower() in already_committed:
+            log.info(f"SKIP     {email}  (already in '{added_tab}')")
+            skip_rows.append(item)
+        elif email.lower() in already_in_associates:
+            log.info(f"RESUME   {email}  (in Associates, not yet committed — resuming)")
+            partial_rows.append(item)
+        else:
+            full_rows.append(item)
+
+    log.info(
+        f"Categorised: {len(full_rows)} full | {len(partial_rows)} resume | {len(skip_rows)} skip"
+    )
+
+    STAGE_COL = 15  # column P
+
+    # ── Full processing ───────────────────────────────────────────────────────
+    # Order: Associates → Group → Slack → Added to SEAL Life (commit marker last).
+    # If the script crashes before the commit write, next run finds the email in
+    # Associates and routes it through the partial-resume path instead.
+    if full_rows:
+        src_indices = [i for i, _, _ in full_rows]
+
+        # 1. Associates (Clan Life sheet)
+        dest_row = find_next_blank_row(sheets_svc, clan_sid, associates_tab, associates_start)
+        copy_rows_with_formatting(sheets_svc, challenge_sid, applicants_tab, src_indices,
+                                  clan_sid, associates_tab, dest_row, [STAGE_COL], log)
+        # Copy column P formula from the row above into each newly written row
         if dest_row > 1:
             copy_formula_down(sheets_svc, clan_sid, associates_tab,
                               source_row=dest_row - 1,
                               dest_start_row=dest_row,
-                              num_rows=len(associates_rows),
-                              col_idx=15,
+                              num_rows=len(full_rows),
+                              col_idx=STAGE_COL,
                               log=log)
 
-        # 3. Add each email to the active Google Group
-        for _, _, email in new_rows:
+        # 2. Group + Slack (per-email)
+        for _, _, email in full_rows:
             add_to_google_group(admin_svc, active_group, email, log)
-
-        # 4. Handle Slack membership — invite new members, reactivate returning ones
-        for _, _, email in new_rows:
             handle_slack(email, log)
 
-        # 5. Delete processed rows from Applicants tab (reverse order avoids index shifting)
-        # Note: will fail gracefully if the tab has protected ranges — remove sheet
-        # protection via Data > Protect sheets and ranges to enable this step.
-        row_indices = [i for i, _, _ in new_rows]
+        # 3. Added to SEAL Life — commit marker, written last
+        added_next_row = find_next_blank_row(sheets_svc, challenge_sid, added_tab, 1)
+        copy_rows_with_formatting(sheets_svc, challenge_sid, applicants_tab, src_indices,
+                                  challenge_sid, added_tab, added_next_row, [], log)
+
+    # ── Partial resume ────────────────────────────────────────────────────────
+    # Associates row already exists — skip that write, redo group add + Slack,
+    # then write the commit marker.
+    for i, row, email in partial_rows:
+        log.info(f"  Resuming partial for {email}")
+        add_to_google_group(admin_svc, active_group, email, log)
+        handle_slack(email, log)
+        added_next_row = find_next_blank_row(sheets_svc, challenge_sid, added_tab, 1)
+        copy_rows_with_formatting(sheets_svc, challenge_sid, applicants_tab, [i],
+                                  challenge_sid, added_tab, added_next_row, [], log)
+
+    # ── Delete all processed rows from Applicants ─────────────────────────────
+    # Covers full, resume, and skip categories.  Deletion can fail if the tab
+    # has protected ranges — the dedup above ensures re-runs are safe regardless.
+    rows_to_delete = [i for i, _, _ in (skip_rows + partial_rows + full_rows)]
+    if rows_to_delete:
         try:
-            delete_rows(sheets_svc, challenge_sid, applicants_tab, row_indices, log)
+            delete_rows(sheets_svc, challenge_sid, applicants_tab, rows_to_delete, log)
         except HttpError as e:
-            log.warning(f"  [Sheets] Could not delete rows from '{applicants_tab}' (protected?): {e.reason}")
+            log.warning(
+                f"  [Sheets] Could not delete rows from '{applicants_tab}' (protected?): {e.reason}"
+            )
 
     log.info("Run complete.")
 
