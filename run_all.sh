@@ -8,11 +8,6 @@ cd "$DIR/execution"
 # Activate virtual environment
 source "$DIR/venv/bin/activate"
 
-# Ensure proxy env vars are available (cron has a minimal environment)
-export ALL_PROXY="socks5h://localhost:61809"
-export HTTP_PROXY="http://localhost:61806"
-export HTTPS_PROXY="http://localhost:61806"
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TEMPORARY: Error notification to harrisnakajima@gmail.com
 # To remove: delete the notify_error function and the
