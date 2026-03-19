@@ -33,7 +33,9 @@ from googleapiclient.errors import HttpError
 # ── Paths ──────────────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).resolve().parent.parent
 CONFIG     = ROOT / "config.yaml"
-TOKEN_GMAIL = ROOT / "token_gmail.json"   # sealdirector@gmail.com — sheets + gmail
+TOKEN_GMAIL = ROOT / "token_applicants.json"  # sealdirector@gmail.com — sheets + gmail.send
+# Separate from token_gmail.json (used by process_challenge/clan_cleanup for sheets-only)
+# so scope differences between scripts never cause one to silently strip the other's grants.
 TOKEN_ADMIN = ROOT / "token_admin.json"   # admin@maxalton.com — group management
 CREDS      = ROOT / "credentials.json"
 TMP        = ROOT / ".tmp"
@@ -313,7 +315,7 @@ def main():
             new_approved.append((row, email, name))
             log.info(f"APPROVED  {email}  (status='{status}')")
 
-    log.info(f"New this run → approved: {len(new_approved)}, rejected: {len(new_rejected)}")
+    log.info(f"New this run -> approved: {len(new_approved)}, rejected: {len(new_rejected)}")
 
     # ── Write approved rows + side effects ────────────────────────────────────
     if new_approved:

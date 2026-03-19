@@ -4,9 +4,7 @@
 # Secrets & credentials
 .env
 credentials.json
-token.json
-token_gmail.json
-token_admin.json
+token*.json
 
 # Intermediate files (always regenerable)
 .tmp/
