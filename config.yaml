@@ -46,7 +46,7 @@ email:
   body: |
     Hi {name},
 
-    Congratulations! Your SEAL application has been reviewed and approved!To proceed, join SEAL Discord server, where you’ll find the initial onboarding instructions: 
+    Congratulations! Your SEAL application has been reviewed and approved!To proceed, join SEAL Discord server, where you’ll find the initial onboarding instructions:
     https://discord.gg/YqHJHcHVtu
 
     OPTIONAL (IF YOU NEVER USED DISCORD BEFORE)
@@ -54,12 +54,37 @@ email:
     Beginner’s Guide: https://support.discord.com/hc/en-us/articles/360045138571-Beginner-s-Guide-to-Discord
 
     Once you’ve joined SEAL Discord server, navigate to the #instructions channel.
-    It helps to stay in the Crossroads voice channel while working through the instructions. , This way you will be able to communicate with other onboarders and with SEAL members who may stop by to chat. 
+    It helps to stay in the Crossroads voice channel while working through the instructions. , This way you will be able to communicate with other onboarders and with SEAL members who may stop by to chat.
 
-    We're excited to have you on board!
+    We’re excited to have you on board!
 
     Best,
     The SEAL Team
+
+
+# ── Rejection Email ─────────────────────────────────────────────────────────────
+# Sent to every newly rejected applicant.
+# Available placeholders in body: {name}, {email}
+rejection_email:
+  subject: "Your SEAL Application"
+  body: |
+    Hi {name},
+
+    Thank you for taking the time to apply to SEAL. After careful review,
+    we are unable to approve your application at this time.
+
+    We appreciate your interest and encourage you to keep developing your skills.
+
+    Best,
+    The SEAL Team
+
+
+# ── Testing ────────────────────────────────────────────────────────────────────
+# When test_email_override is set to a non-empty email address, ALL outgoing
+# emails (approval and rejection) are redirected to that address instead of the
+# real applicant. Set to "" to send to real recipients (production mode).
+testing:
+  test_email_override: "harrisnakajima@gmail.com"
 
 # ── SEAL Applicant Challenge ────────────────────────────────────────────────
 # Monitors the Applicants tab for students who have reached stage 3.

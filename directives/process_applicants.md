@@ -1,10 +1,10 @@
 # Directive: Process SEAL Applicants
 
 ## Goal
-Hourly: read new rows from the "Current Applicants" tab of the SEAL Applicants Google Sheet, classify each as Approved or Rejected, copy rows to the correct tab, add approved emails to the SEAL onboarding Google Group, and send approval emails.
+Hourly: read new rows from the "Current Applicants" tab of the SEAL Applicants Google Sheet, classify each as Approved or Rejected, copy rows to the correct tab, add approved emails to the SEAL onboarding Google Group, and send approval or rejection emails.
 
 ## Inputs
-- `config.yaml` — spreadsheet ID, column indices, rejection keywords, Google Group email, email template
+- `config.yaml` — spreadsheet ID, column indices, rejection keywords, Google Group email, approval email template, rejection email template, test override
 - Google Sheet: "SEAL Applicants" → tab "Current Applicants"
 - OAuth credentials: `credentials.json` + `token.json`
 
@@ -30,8 +30,16 @@ python execution/process_applicants.py
 8. **Ensure 10 empty rows** at the bottom of both Approved and Rejected tabs
 9. **For each approved row:**
    - Add email (column B) to Google Group via Admin SDK
-   - Send approval email via Gmail API (template from config)
-10. **Log** all actions to `.tmp/process_applicants.log`
+   - Send approval email via Gmail API (`email.subject` / `email.body` from config)
+10. **For each rejected row:**
+    - Send rejection email via Gmail API (`rejection_email.subject` / `rejection_email.body` from config)
+11. **Log** all actions to `.tmp/process_applicants.log`
+
+### Test override
+When `testing.test_email_override` in `config.yaml` is set to a non-empty email address,
+**all outgoing emails** (approval and rejection) are redirected to that address.
+The real recipient's address is still used for `{email}` placeholder substitution and is
+logged alongside the override address. Set to `""` to send to real recipients.
 
 ## Column Reference (0-indexed)
 | Column | Index | Field |
@@ -76,4 +84,4 @@ To run manually at any time: `python execution/process_applicants.py`
 - **Non-email values in column B**: Sheet contains annotation rows (e.g. "Added by A10", "Email" header artifacts) — script validates email format (must contain @) and skips non-email values
 - **Duplicate emails in source sheet**: Same email can appear multiple times in Current Applicants — script deduplicates within each run, processing only the first occurrence
 - **"Previously Departed" status**: Old relic of past SEAL processes, will not appear in future — treated as Approved (no rejection keyword match), which is correct
-- **TEST MODE**: `TEST_MODE = True` flag at top of script limits processing to `harrisna@uw.edu` only. Remove before production deployment.
+- **Test email override**: `testing.test_email_override` in `config.yaml` redirects all outgoing emails to the specified address. Set to `""` to go live. Both approval and rejection emails respect this setting.

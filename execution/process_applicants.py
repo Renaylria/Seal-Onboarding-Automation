@@ -178,21 +178,39 @@ def add_to_google_group(admin_svc, group_email: str, member_email: str, log):
 # Email
 # ══════════════════════════════════════════════════════════════════════════════
 
-def send_approval_email(gmail_svc, sender: str, recipient: str, name: str,
-                        subject: str, body_template: str, log):
-    """Send approval email via Gmail API using the configured template."""
+def send_email(gmail_svc, sender: str, recipient: str, name: str,
+               subject: str, body_template: str, log,
+               test_override: str = ""):
+    """Send an email via Gmail API using the configured template.
+
+    Args:
+        gmail_svc:      Authenticated Gmail API client.
+        sender:         From address (e.g. admin@maxalton.com).
+        recipient:      Real recipient email address.
+        name:           Recipient name used in {name} placeholder.
+        subject:        Email subject line.
+        body_template:  Body string supporting {name} and {email} placeholders.
+        log:            Logger instance.
+        test_override:  When non-empty, redirects the email to this address
+                        instead of the real recipient (for testing). Set via
+                        testing.test_email_override in config.yaml.
+    """
+    actual_to = test_override if test_override else recipient
     try:
         body = body_template.format(name=name or recipient, email=recipient)
         msg = EmailMessage()
-        msg["To"] = recipient
+        msg["To"] = actual_to
         msg["From"] = sender
         msg["Subject"] = subject
         msg.set_content(body)
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         gmail_svc.users().messages().send(userId="me", body={"raw": raw}).execute()
-        log.info(f"  [Email] Sent to: {recipient}")
+        if test_override:
+            log.info(f"  [Email] Sent to: {actual_to} (test override — real recipient: {recipient})")
+        else:
+            log.info(f"  [Email] Sent to: {actual_to}")
     except Exception as e:
-        log.error(f"  [Email] Failed for {recipient}: {e}")
+        log.error(f"  [Email] Failed for {actual_to}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -229,6 +247,11 @@ def main():
     keywords       = cfg["rejection_keywords"]
     group_email    = cfg["google_group"]["email"]
     email_cfg      = cfg["email"]
+    rejection_email_cfg = cfg["rejection_email"]
+    test_override  = cfg.get("testing", {}).get("test_email_override", "").strip()
+
+    if test_override:
+        log.info(f"TEST MODE: all outgoing emails will be sent to {test_override}")
 
     # Build API clients — two separate auth accounts
     gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, hint="sealdirector@gmail.com")
@@ -297,12 +320,17 @@ def main():
         append_rows(sheets_svc, sid, approved_tab, [r for r, _, _ in new_approved])
         for _, email, name in new_approved:
             add_to_google_group(admin_svc, group_email, email, log)
-            send_approval_email(gmail_svc, email_cfg["sender"], email, name,
-                                email_cfg["subject"], email_cfg["body"], log)
+            send_email(gmail_svc, email_cfg["sender"], email, name,
+                       email_cfg["subject"], email_cfg["body"], log,
+                       test_override=test_override)
 
-    # ── Write rejected rows ────────────────────────────────────────────────────
+    # ── Write rejected rows + send rejection email ─────────────────────────────
     if new_rejected:
         append_rows(sheets_svc, sid, rejected_tab, [r for r, _, _ in new_rejected])
+        for _, email, name in new_rejected:
+            send_email(gmail_svc, email_cfg["sender"], email, name,
+                       rejection_email_cfg["subject"], rejection_email_cfg["body"], log,
+                       test_override=test_override)
 
     # ── Maintain 10 empty rows in both tabs ────────────────────────────────────
     for tab in [approved_tab, rejected_tab]:
