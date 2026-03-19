@@ -1,0 +1,116 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# SEAL Applicant Processing — Configuration
+# Edit this file to change behavior. No code changes needed.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Google Sheet ───────────────────────────────────────────────────────────────
+# Spreadsheet ID is the long string in the Google Sheets URL:
+#   https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit
+sheets:
+  spreadsheet_id: "1mAkNwdaaV68dt5iPGXcEKlf3LOO3ifMmU1oUBr57lPQ"
+  current_applicants_tab: "Current Applicants"
+  approved_tab: "Approved"
+  rejected_tab: "Rejected"
+
+  # Column indices are 0-based (A=0, B=1, C=2, ..., N=13)
+  email_column_index: 1       # Column B — applicant email address
+  status_column_index: 13     # Column N — approval status set by reviewer
+  name_column_index: 3        # Column D — applicant name (used in email greeting)
+  min_empty_rows: 10          # Minimum empty rows to keep at the bottom of Approved/Rejected tabs
+
+
+# ── Rejection Logic ────────────────────────────────────────────────────────────
+# Rows whose status (column N) CONTAINS any of these keywords are → Rejected.
+# Matching is case-insensitive. All other rows (including blank status) → Approved.
+# Add or remove keywords freely.
+rejection_keywords:
+  - "Disapproved"
+  - "Rejected"
+  - "Previously Applied"
+  - "Previously Ex-communicado"
+
+
+# ── Google Group ───────────────────────────────────────────────────────────────
+# The email address of the Google Group to add approved applicants to.
+# Requires Google Workspace Admin SDK access (see directive for setup).
+google_group:
+  email: "onboarding@maxalton.com"
+
+
+# ── Approval Email ─────────────────────────────────────────────────────────────
+# Sent to every newly approved applicant.
+# Available placeholders in body: {name}, {email}
+email:
+  sender: "admin@maxalton.com"
+  subject: "Welcome to SEAL — Your Application Has Been Approved"
+  body: |
+    Hi {name},
+
+    Congratulations! Your SEAL application has been reviewed and approved!To proceed, join SEAL Discord server, where you’ll find the initial onboarding instructions: 
+    https://discord.gg/YqHJHcHVtu
+
+    OPTIONAL (IF YOU NEVER USED DISCORD BEFORE)
+    Getting Started: https://support.discord.com/hc/en-us/articles/360033931551-Getting-Started
+    Beginner’s Guide: https://support.discord.com/hc/en-us/articles/360045138571-Beginner-s-Guide-to-Discord
+
+    Once you’ve joined SEAL Discord server, navigate to the #instructions channel.
+    It helps to stay in the Crossroads voice channel while working through the instructions. , This way you will be able to communicate with other onboarders and with SEAL members who may stop by to chat. 
+
+    We're excited to have you on board!
+
+    Best,
+    The SEAL Team
+
+# ── SEAL Applicant Challenge ────────────────────────────────────────────────
+# Monitors the Applicants tab for students who have reached stage 3.
+# Runs in parallel with process_applicants.py on the same hourly schedule.
+challenge:
+  # Source: SEAL Applicant Challenge sheet → Applicants tab
+  applicant_challenge_sheet_id: "1tVHLoybyghVJo5w93UmeG5dBSpHqMSeq7ce1t7hnBYo"
+  applicants_tab: "Applicants"
+
+  # Column indices (0-based: A=0, B=1 ... P=15 ... AP=41)
+  stage_column_index: 15        # Column P — checked for stage trigger value
+  stage_trigger: "stage 3"     # Case-insensitive match; triggers processing
+  email_column_index: 41        # Column AP — email added to active group
+
+  # Destination 1: new tab in the same Applicant Challenge sheet
+  added_to_seal_life_tab: "Added to SEAL Life"
+
+  # Destination 2: SEAL Clan Life sheet → Associates tab
+  clan_life_sheet_id: "1k19sS9NfwlVfG7GCCf18LO69pr4reSOTN6v1lY2nykQ"
+  associates_tab: "Associates"
+  associates_start_row: 14    # Rows 1-13 contain sample rows; script writes below them
+
+  # Google Workspace group for active members
+  active_group_email: "seal-active@maxalton.com"
+
+# ── Clan Life Cleanup ────────────────────────────────────────────────────────
+# Monitors Associates tab for status triggers and routes rows to destination
+# tabs, removes from Google Group, and deletes from Associates.
+# Edit status_triggers values to adjust matching (case-insensitive startswith).
+clan_cleanup:
+  # Source
+  clan_life_sheet_id: "1k19sS9NfwlVfG7GCCf18LO69pr4reSOTN6v1lY2nykQ"
+  associates_tab: "Associates"
+  status_column_index: 10      # Column K
+  email_column_index: 41       # Column AP
+  start_row: 14                # Rows 1-13 are sample/header rows; write below them
+
+  # Status triggers (case-insensitive startswith match)
+  status_triggers:
+    gameover: "GameOver"
+    ex_associate: "Ex-Associate"
+    affiliate: "Affiliate"
+
+  # GameOver → Clan Life AAD Ex-Communicado + remove from group
+  # Ex-Associate → Clan Life AAD Ex-Associate + remove from group
+  aad_sheet_id: "1HJmG3VZs0Z-r-aU0hBFg3kjazYimtkJP3tuWky1JRyM"
+  ex_communicado_tab: "Ex-Communicado"
+  ex_associate_tab: "Ex-Associate"
+
+  # Affiliate → SEAL Clan Life Affiliates (no group removal)
+  affiliates_tab: "Affiliates"
+
+  # Google Workspace group to remove GameOver and Ex-Associate members from
+  active_group_email: "seal-active@maxalton.com"

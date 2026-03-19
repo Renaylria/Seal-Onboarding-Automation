@@ -1,7 +1,12 @@
+# Claude Code local settings (IDE-specific, not for version control)
+.claude/
+
 # Secrets & credentials
 .env
 credentials.json
 token.json
+token_gmail.json
+token_admin.json
 
 # Intermediate files (always regenerable)
 .tmp/
