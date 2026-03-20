@@ -42,6 +42,10 @@ load_dotenv()
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# Matches cell references in formulas: optional $ + 1-3 column letters + optional $ + row digits
+# Groups: (1) column part with optional $, (2) $ if absolute row, (3) row number
+_CELL_REF_RE = re.compile(r'(?<![A-Za-z])(\$?[A-Z]{1,3})(\$?)(\d+)')
+
 import yaml
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -186,6 +190,30 @@ def find_next_blank_row(svc, spreadsheet_id: str, tab: str, start_row: int) -> i
     return max(len(col_a) + 1, start_row)
 
 
+def adjust_formula_row_refs(formula: str, row_offset: int) -> str:
+    """Shift relative row references in a Google Sheets formula by row_offset.
+
+    Absolute row references (prefixed with $) are left unchanged.
+    Example: adjust_formula_row_refs('=IF(A25="",B25,C$1)', 60)
+             → '=IF(A85="",B85,C$1)'
+    """
+    if not formula or not formula.startswith("=") or row_offset == 0:
+        return formula
+
+    def _replace(m):
+        col_part = m.group(1)   # e.g. "$A" or "A" or "AB"
+        dollar   = m.group(2)   # "$" if absolute row, else ""
+        row_num  = m.group(3)   # e.g. "25"
+        if dollar:              # absolute row — leave unchanged
+            return m.group(0)
+        new_row = int(row_num) + row_offset
+        if new_row < 1:
+            new_row = 1
+        return f"{col_part}{new_row}"
+
+    return _CELL_REF_RE.sub(_replace, formula)
+
+
 def copy_rows_with_formatting(svc, src_sid: str, src_tab: str,
                                src_row_indices: list,
                                dst_sid: str, dst_tab: str,
@@ -228,6 +256,20 @@ def copy_rows_with_formatting(svc, src_sid: str, src_tab: str,
                 cells[col] = {}   # empty CellData clears the cell
         rd["values"] = cells
         rows_to_write.append(rd)
+
+    # ── 2b. Adjust formula row references to match destination rows ─────
+    for i, (idx, rd) in enumerate(zip(src_row_indices, rows_to_write)):
+        src_row_1indexed = idx + 1                     # source row (1-indexed)
+        dst_row_1indexed = dst_start_row + i           # destination row (1-indexed)
+        row_offset = dst_row_1indexed - src_row_1indexed
+        if row_offset == 0:
+            continue
+        for cell in rd.get("values", []):
+            uev = cell.get("userEnteredValue", {})
+            if "formulaValue" in uev:
+                uev["formulaValue"] = adjust_formula_row_refs(
+                    uev["formulaValue"], row_offset
+                )
 
     # ── 3. Write to destination with full formatting ───────────────────────
     # Get sheetId and columnCount together to avoid an extra API call.
