@@ -44,7 +44,8 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # Matches cell references in formulas: optional $ + 1-3 column letters + optional $ + row digits
 # Groups: (1) column part with optional $, (2) $ if absolute row, (3) row number
-_CELL_REF_RE = re.compile(r'(?<![A-Za-z])(\$?[A-Z]{1,3})(\$?)(\d+)')
+# The lookbehind excludes letters AND '!' so cross-sheet refs (e.g. Setup!I9) are not shifted.
+_CELL_REF_RE = re.compile(r'(?<![A-Za-z!])(\$?[A-Z]{1,3})(\$?)(\d+)')
 
 import yaml
 from google.oauth2.credentials import Credentials
