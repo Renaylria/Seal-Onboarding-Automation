@@ -142,6 +142,11 @@ clan_cleanup:
   # Google Workspace group to remove GameOver and Ex-Associate members from
   active_group_email: "seal-active@maxalton.com"
 
+  # Emails to skip during cleanup (keep active on Slack even if GameOver/Ex-Associate).
+  # Use this when someone needs temporary Slack access despite their sheet status.
+  slack_skip_emails:
+    - "ashama@uw.edu"
+
 # ── Automation Log ──────────────────────────────────────────────────────────
 # Google Sheet used by run_logger.py to track all script runs and errors.
 # Owned by sealdirector@gmail.com.

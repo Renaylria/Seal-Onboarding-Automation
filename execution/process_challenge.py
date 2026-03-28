@@ -60,6 +60,10 @@ from run_logger import RunLogger
 
 from playwright.sync_api import sync_playwright
 
+# Ground-truth verification (shared module in sudoku-blueprint)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sudoku-blueprint"))
+from verify import verify_group_member, verify_slack_active
+
 # ── Slack credentials (from .env) ──────────────────────────────────────────────
 SLACK_USER_TOKEN     = os.getenv("SLACK_USER_TOKEN", "").strip()
 SLACK_ADMIN_EMAIL    = os.getenv("SLACK_ADMIN_EMAIL", "").strip()
@@ -428,11 +432,12 @@ def slack_lookup_user(email: str, log) -> tuple:
     If not found, falls back to paginating users.list which includes
     deactivated accounts (deleted=True).
 
-    Returns (user_id, is_deactivated) if found, or (None, False) if not found
-    or if the token is not configured.
+    Returns (user_id, is_deactivated, api_failed) — api_failed is True
+    when the lookup could not complete due to a token/API error (callers
+    should fall through to Playwright).
     """
     if not SLACK_USER_TOKEN:
-        return None, False
+        return None, False, True
 
     # Fast path — works for active users
     resp = http_requests.get(
@@ -444,10 +449,10 @@ def slack_lookup_user(email: str, log) -> tuple:
     data = resp.json()
     if data.get("ok"):
         user = data["user"]
-        return user["id"], user.get("deleted", False)
+        return user["id"], user.get("deleted", False), False
     if data.get("error") != "users_not_found":
         log.error(f"  [Slack] Lookup error for {email}: {data.get('error')}")
-        return None, False
+        return None, False, True
 
     # Fallback — paginate users.list to catch deactivated accounts
     log.info(f"  [Slack] {email} not found via lookupByEmail — scanning full user list for deactivated account")
@@ -466,17 +471,17 @@ def slack_lookup_user(email: str, log) -> tuple:
         data = resp.json()
         if not data.get("ok"):
             log.error(f"  [Slack] users.list error: {data.get('error')}")
-            return None, False
+            return None, False, True
         for member in data.get("members", []):
             profile = member.get("profile", {})
             member_email = profile.get("email", "").strip().lower()
             if member_email == target:
-                return member["id"], member.get("deleted", False)
+                return member["id"], member.get("deleted", False), False
         cursor = data.get("response_metadata", {}).get("next_cursor", "")
         if not cursor:
             break
 
-    return None, False
+    return None, False, False
 
 
 def slack_invite_user(email: str, log) -> bool:
@@ -797,11 +802,13 @@ def handle_slack(email: str, log):
     Note: users.admin.invite API requires the legacy 'client' scope (not available on
     modern Slack apps).  New-member invites use slack_invite_playwright instead.
     """
-    if not SLACK_USER_TOKEN:
-        log.warning("  [Slack] SLACK_USER_TOKEN not set — skipping Slack step")
-        return
+    user_id, is_deactivated, api_failed = slack_lookup_user(email, log)
 
-    user_id, is_deactivated = slack_lookup_user(email, log)
+    if api_failed:
+        # API lookup failed (token revoked/expired) — fall through to Playwright
+        log.warning(f"  [Slack] API lookup failed for {email} — falling back to Playwright invite")
+        slack_invite_playwright(email, log)
+        return
 
     if user_id is None:
         # Brand-new Slack user — invite via admin panel GUI
@@ -974,8 +981,13 @@ def _run_challenge(log, rl):
         for _, row, email in full_rows:
             set_live("adding", "Adding to group + Slack", email=email, step="group")
             add_to_google_group(admin_svc, active_group, email, log)
+            gv = verify_group_member(admin_svc, active_group, email)
+            log.info("  [Verify] Group add: %s", gv.detail)
             set_live("adding", "Inviting to Slack", email=email, step="slack")
             handle_slack(email, log)
+            if SLACK_USER_TOKEN:
+                sv = verify_slack_active(email, SLACK_USER_TOKEN, "bearer")
+                log.info("  [Verify] Slack active: %s", sv.detail)
             log_event("add", email, "STAGE3_ADDED")
             # Extract name from row for notes (column index 1 is typically the name)
             row_name = row[1].strip() if len(row) > 1 else ""

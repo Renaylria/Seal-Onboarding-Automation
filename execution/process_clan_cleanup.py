@@ -38,6 +38,10 @@ from tui_status import set_live, log_run_start, log_run_msg, log_event, log_resu
 from run_logger import RunLogger
 from playwright.sync_api import sync_playwright
 
+# Ground-truth verification (shared module in sudoku-blueprint)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sudoku-blueprint"))
+from verify import verify_group_not_member, verify_slack_deactivated
+
 load_dotenv()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -405,7 +409,7 @@ def remove_from_google_group(
 # Slack
 # ══════════════════════════════════════════════════════════════════════════════
 
-def slack_lookup_user(email: str, log: logging.Logger) -> tuple[str | None, bool]:
+def slack_lookup_user(email: str, log: logging.Logger) -> tuple[str | None, bool, bool]:
     """Look up a Slack user by email.
 
     First tries users.lookupByEmail (fast path, active users only).
@@ -416,11 +420,12 @@ def slack_lookup_user(email: str, log: logging.Logger) -> tuple[str | None, bool
         log:   Logger instance.
 
     Returns:
-        (user_id, is_deactivated) if found, or (None, False) if not found
-        or if SLACK_USER_TOKEN is not configured.
+        (user_id, is_deactivated, api_failed) — api_failed is True when
+        the lookup could not complete due to a token/API error (callers
+        should fall through to Playwright).
     """
     if not SLACK_USER_TOKEN:
-        return None, False
+        return None, False, True
 
     # Fast path — active users only
     resp = http_requests.get(
@@ -432,10 +437,10 @@ def slack_lookup_user(email: str, log: logging.Logger) -> tuple[str | None, bool
     data = resp.json()
     if data.get("ok"):
         user = data["user"]
-        return user["id"], user.get("deleted", False)
+        return user["id"], user.get("deleted", False), False
     if data.get("error") != "users_not_found":
         log.error("  [Slack] Lookup error for %s: %s", email, data.get("error"))
-        return None, False
+        return None, False, True
 
     # Fallback — paginate to find deactivated accounts
     log.info(
@@ -456,17 +461,17 @@ def slack_lookup_user(email: str, log: logging.Logger) -> tuple[str | None, bool
         data = resp.json()
         if not data.get("ok"):
             log.error("  [Slack] users.list error: %s", data.get("error"))
-            return None, False
+            return None, False, True
         for member in data.get("members", []):
             profile = member.get("profile", {})
             member_email = profile.get("email", "").strip().lower()
             if member_email == target:
-                return member["id"], member.get("deleted", False)
+                return member["id"], member.get("deleted", False), False
         cursor = data.get("response_metadata", {}).get("next_cursor", "")
         if not cursor:
             break
 
-    return None, False
+    return None, False, False
 
 
 def slack_deactivate_api(user_id: str, log: logging.Logger) -> bool:
@@ -740,7 +745,17 @@ def handle_slack_deactivate(email: str, log: logging.Logger) -> None:
         log.warning("  [Slack] SLACK_USER_TOKEN not set — skipping Slack deactivation")
         return
 
-    user_id, is_deactivated = slack_lookup_user(email, log)
+    user_id, is_deactivated, api_failed = slack_lookup_user(email, log)
+
+    if api_failed:
+        # API lookup failed (token revoked/expired) — fall through to Playwright
+        log.warning("  [Slack] API lookup failed for %s — falling back to Playwright", email)
+        success = slack_deactivate_playwright(email, log)
+        if not success:
+            add_pending_deactivation(email)
+        else:
+            remove_pending_deactivation(email)
+        return
 
     if user_id is None:
         log.info("  [Slack] %s not found in workspace — no deactivation needed", email)
@@ -804,6 +819,7 @@ def _run_clan_cleanup(log, rl):
     affiliates_tab        = cfg["affiliates_tab"]
     active_group_email    = cfg["active_group_email"]
     start_row             = cfg["start_row"]             # 14
+    slack_skip_emails     = {e.lower() for e in cfg.get("slack_skip_emails", [])}
 
     # ── Authenticate ──────────────────────────────────────────────────────────
     log.info("Authenticating (Sheets)…")
@@ -818,9 +834,20 @@ def _run_clan_cleanup(log, rl):
     pending = load_pending_deactivations()
     if pending:
         log.info("Retrying %d previously failed Slack deactivation(s)…", len(pending))
+        # Remove skip-listed emails from pending queue
+        for skip_email in [e for e in pending if e.lower() in slack_skip_emails]:
+            log.info("  [Slack] Removing %s from pending queue (in slack_skip_emails)", skip_email)
+            remove_pending_deactivation(skip_email)
+        pending = [e for e in pending if e.lower() not in slack_skip_emails]
         for email in list(pending):
             log.info("  Retrying: %s", email)
-            user_id, is_deactivated = slack_lookup_user(email, log)
+            user_id, is_deactivated, api_failed = slack_lookup_user(email, log)
+            if api_failed:
+                log.warning("  [Slack] API lookup failed — retrying %s via Playwright", email)
+                success = slack_deactivate_playwright(email, log)
+                if success:
+                    remove_pending_deactivation(email)
+                continue
             if user_id is None:
                 log.info(
                     "  [Slack] %s no longer in workspace — removing from retry queue", email
@@ -936,8 +963,16 @@ def _run_clan_cleanup(log, rl):
             if member_email:
                 set_live("removing", "GameOver — removing", email=member_email, step="group")
                 remove_from_google_group(admin_svc, active_group_email, member_email, log)
-                set_live("removing", "GameOver — deactivating Slack", email=member_email, step="slack")
-                handle_slack_deactivate(member_email, log)
+                gv = verify_group_not_member(admin_svc, active_group_email, member_email)
+                log.info("  [Verify] Group removal: %s", gv.detail)
+                if member_email.lower() in slack_skip_emails:
+                    log.info("  [Slack] SKIPPING deactivation for %s (in slack_skip_emails)", member_email)
+                else:
+                    set_live("removing", "GameOver — deactivating Slack", email=member_email, step="slack")
+                    handle_slack_deactivate(member_email, log)
+                    if SLACK_USER_TOKEN:
+                        sv = verify_slack_deactivated(member_email, SLACK_USER_TOKEN, "bearer")
+                        log.info("  [Verify] Slack deactivated: %s", sv.detail)
                 log_event("remove", member_email, "REMOVED", reason="GameOver flag")
                 rl.add_note(f"GAMEOVER → Ex-Communicado: {member_name} ({member_email})")
             else:
@@ -962,8 +997,16 @@ def _run_clan_cleanup(log, rl):
             if member_email:
                 set_live("removing", "Ex-Associate — removing", email=member_email, step="group")
                 remove_from_google_group(admin_svc, active_group_email, member_email, log)
-                set_live("removing", "Ex-Associate — deactivating Slack", email=member_email, step="slack")
-                handle_slack_deactivate(member_email, log)
+                gv = verify_group_not_member(admin_svc, active_group_email, member_email)
+                log.info("  [Verify] Group removal: %s", gv.detail)
+                if member_email.lower() in slack_skip_emails:
+                    log.info("  [Slack] SKIPPING deactivation for %s (in slack_skip_emails)", member_email)
+                else:
+                    set_live("removing", "Ex-Associate — deactivating Slack", email=member_email, step="slack")
+                    handle_slack_deactivate(member_email, log)
+                    if SLACK_USER_TOKEN:
+                        sv = verify_slack_deactivated(member_email, SLACK_USER_TOKEN, "bearer")
+                        log.info("  [Verify] Slack deactivated: %s", sv.detail)
                 log_event("remove", member_email, "REMOVED", reason="Ex-Associate")
                 rl.add_note(f"EX-ASSOCIATE → Ex-Associate tab: {member_name} ({member_email})")
             else:
