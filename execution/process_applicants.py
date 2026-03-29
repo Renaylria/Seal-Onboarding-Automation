@@ -553,13 +553,24 @@ def _run_applicants(log, rl):
         write_to_next_blank_row(sheets_svc, sid, approved_tab,
                                 clear_col([r for r, _, _ in new_approved], email_sent_col),
                                 start_row, log)
+        active_group = "seal-active@maxalton.com"
         for _, email, name in new_approved:
-            set_live("adding", "Adding to group", email=email, step="group")
+            # Add to onboarding group
+            set_live("adding", "Adding to onboarding group", email=email, step="group")
             add_to_google_group(admin_svc, group_email, email, log)
             gv = verify_group_member(admin_svc, group_email, email)
-            log.info("  [Verify] Group add: %s", gv.detail)
+            log.info("  [Verify] onboarding add: %s", gv.detail)
             if not gv.ok:
                 log.error("  [Verify] FAIL — %s not confirmed in %s", email, group_email)
+
+            # Add to seal-active group (needed for dashboard access during challenge)
+            set_live("adding", "Adding to seal-active group", email=email, step="group")
+            add_to_google_group(admin_svc, active_group, email, log)
+            gv2 = verify_group_member(admin_svc, active_group, email)
+            log.info("  [Verify] seal-active add: %s", gv2.detail)
+            if not gv2.ok:
+                log.error("  [Verify] FAIL — %s not confirmed in %s", email, active_group)
+
             log_event("add", email, "APPROVED", name=name)
 
     if new_rejected:
