@@ -62,7 +62,7 @@ from playwright.sync_api import sync_playwright
 
 # Ground-truth verification (shared module in sudoku-blueprint)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sudoku-blueprint"))
-from verify import verify_group_member, verify_slack_active
+from verify import verify_group_member, verify_group_not_member, verify_slack_active
 
 # ── Slack credentials (from .env) ──────────────────────────────────────────────
 SLACK_USER_TOKEN     = os.getenv("SLACK_USER_TOKEN", "").strip()
@@ -73,7 +73,7 @@ SLACK_WORKSPACE      = "sealuw.slack.com"
 # ── Paths ──────────────────────────────────────────────────────────────────────
 ROOT        = Path(__file__).resolve().parent.parent
 CONFIG      = ROOT / "config.yaml"
-TOKEN_GMAIL = ROOT / "token_gmail.json"   # sealdirector@gmail.com — sheets
+TOKEN_GMAIL = ROOT / "token_gmail.json"   # sealscripting@gmail.com — sheets
 TOKEN_ADMIN = ROOT / "token_admin.json"   # admin@maxalton.com — group management
 CREDS       = ROOT / "credentials.json"
 TMP              = ROOT / ".tmp"
@@ -283,13 +283,27 @@ def copy_rows_with_formatting(svc, src_sid: str, src_tab: str,
     dst_meta = svc.spreadsheets().get(spreadsheetId=dst_sid).execute()
     dst_sheet_id = None
     dst_col_count = None
+    dst_row_count = None
     for s in dst_meta["sheets"]:
         if s["properties"]["title"] == dst_tab:
             dst_sheet_id = s["properties"]["sheetId"]
             dst_col_count = s["properties"]["gridProperties"]["columnCount"]
+            dst_row_count = s["properties"]["gridProperties"]["rowCount"]
             break
     if dst_sheet_id is None:
         raise ValueError(f"Tab '{dst_tab}' not found in spreadsheet {dst_sid}")
+
+    # Expand grid if needed (0-indexed: last write lands at dst_start_row - 1 + len - 1)
+    rows_needed = (dst_start_row - 1) + len(rows_to_write)
+    if rows_needed > dst_row_count:
+        svc.spreadsheets().batchUpdate(spreadsheetId=dst_sid, body={"requests": [{
+            "appendDimension": {
+                "sheetId": dst_sheet_id,
+                "dimension": "ROWS",
+                "length": rows_needed - dst_row_count,
+            }
+        }]}).execute()
+        log.info(f"  [Sheets] Expanded '{dst_tab}' by {rows_needed - dst_row_count} row(s)")
 
     # Trim each row to the destination column count
     for rd in rows_to_write:
@@ -419,6 +433,20 @@ def add_to_google_group(admin_svc, group_email: str, member_email: str, log):
             log.info(f"  [Group] Already a member: {member_email}")
         else:
             log.error(f"  [Group] Failed to add {member_email}: {e}")
+
+
+def remove_from_google_group(admin_svc, group_email: str, member_email: str, log):
+    """Remove member_email from a Workspace Google Group via Admin SDK."""
+    try:
+        admin_svc.members().delete(
+            groupKey=group_email, memberKey=member_email
+        ).execute()
+        log.info(f"  [Group] Removed {member_email} from {group_email}")
+    except HttpError as e:
+        if e.resp.status == 404:
+            log.info(f"  [Group] {member_email} not in {group_email} (already removed)")
+        else:
+            log.error(f"  [Group] Failed to remove {member_email} from {group_email}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -557,7 +585,8 @@ def _slack_invite_single(email: str, log) -> bool:
             browser.close()
             return False
 
-        email_field.click()
+        # force=True bypasses the placeholder overlay that intercepts clicks
+        email_field.click(force=True)
         admin_page.wait_for_timeout(500)
         admin_page.keyboard.type(email, delay=30)
         admin_page.keyboard.press("Tab")
@@ -870,9 +899,10 @@ def _run_challenge(log, rl):
     associates_tab     = c["associates_tab"]
     associates_start   = c["associates_start_row"]
     active_group       = c["active_group_email"]
+    onboarding_group   = cfg.get("google_group", {}).get("email", "")
 
     # Build API clients — reuse same token files as process_applicants.py
-    gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, hint="sealdirector@gmail.com")
+    gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, hint="sealscripting@gmail.com")
     admin_creds = get_credentials(SCOPES_ADMIN, TOKEN_ADMIN, hint="admin@maxalton.com")
     sheets_svc  = build("sheets", "v4", http=AuthorizedHttp(gmail_creds, http=make_http()))
     admin_svc   = build("admin", "directory_v1", http=AuthorizedHttp(admin_creds, http=make_http()))
@@ -979,10 +1009,19 @@ def _run_challenge(log, rl):
 
         # 2. Group + Slack (per-email)
         for _, row, email in full_rows:
-            set_live("adding", "Adding to group + Slack", email=email, step="group")
+            # Add to seal-active group
+            set_live("adding", "Adding to seal-active", email=email, step="group")
             add_to_google_group(admin_svc, active_group, email, log)
             gv = verify_group_member(admin_svc, active_group, email)
-            log.info("  [Verify] Group add: %s", gv.detail)
+            log.info("  [Verify] seal-active add: %s", gv.detail)
+
+            # Remove from onboarding group (graduated)
+            if onboarding_group:
+                remove_from_google_group(admin_svc, onboarding_group, email, log)
+                gv2 = verify_group_not_member(admin_svc, onboarding_group, email)
+                log.info("  [Verify] onboarding remove: %s", gv2.detail)
+
+            # Invite to Slack
             set_live("adding", "Inviting to Slack", email=email, step="slack")
             handle_slack(email, log)
             if SLACK_USER_TOKEN:

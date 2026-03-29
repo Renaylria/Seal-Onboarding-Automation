@@ -44,10 +44,14 @@ from proxy_http import make_http
 from tui_status import set_live, log_run_start, log_run_msg, log_event, log_result
 from run_logger import RunLogger
 
+# Ground-truth verification (shared module in sudoku-blueprint)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sudoku-blueprint"))
+from verify import verify_group_member
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).resolve().parent.parent
 CONFIG     = ROOT / "config.yaml"
-TOKEN_GMAIL = ROOT / "token_applicants.json"  # sealdirector@gmail.com — sheets + gmail.send
+TOKEN_GMAIL = ROOT / "token_applicants.json"  # sealscripting@gmail.com — sheets + gmail.send
 # Separate from token_gmail.json (used by process_challenge/clan_cleanup for sheets-only)
 # so scope differences between scripts never cause one to silently strip the other's grants.
 TOKEN_ADMIN = ROOT / "token_admin.json"   # admin@maxalton.com — group management
@@ -56,7 +60,7 @@ TMP        = ROOT / ".tmp"
 LOG_FILE   = TMP / "process_applicants.log"
 
 # ── OAuth Scopes ───────────────────────────────────────────────────────────────
-# sealdirector@gmail.com — reads/writes sheet and sends email
+# sealscripting@gmail.com — reads/writes sheet and sends email
 SCOPES_GMAIL = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/gmail.send",
@@ -460,7 +464,7 @@ def _run_applicants(log, rl):
         log.info(f"TEST WHITELIST active: emails will only be sent to {sorted(test_whitelist)}")
 
     # Build API clients — two separate auth accounts
-    gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, hint="sealdirector@gmail.com")
+    gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, hint="sealscripting@gmail.com")
     admin_creds = get_credentials(SCOPES_ADMIN, TOKEN_ADMIN, hint="admin@maxalton.com")
     http = make_http()
     sheets_svc  = build("sheets", "v4", http=AuthorizedHttp(gmail_creds, http=http))
@@ -552,6 +556,10 @@ def _run_applicants(log, rl):
         for _, email, name in new_approved:
             set_live("adding", "Adding to group", email=email, step="group")
             add_to_google_group(admin_svc, group_email, email, log)
+            gv = verify_group_member(admin_svc, group_email, email)
+            log.info("  [Verify] Group add: %s", gv.detail)
+            if not gv.ok:
+                log.error("  [Verify] FAIL — %s not confirmed in %s", email, group_email)
             log_event("add", email, "APPROVED", name=name)
 
     if new_rejected:
