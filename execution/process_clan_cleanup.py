@@ -894,6 +894,8 @@ def _run_clan_cleanup(log, rl):
 
     data_start_idx = start_row - 1  # 0-based list index of the first data row
 
+    grade_col = 12  # Column M — grade/designation (e.g. "6. Ex-Associate")
+
     for list_idx, row in enumerate(all_rows):
         if list_idx < data_start_idx:
             continue  # skip header / sample rows
@@ -902,12 +904,14 @@ def _run_clan_cleanup(log, rl):
             continue  # row too short to have a status value
 
         status = row[status_col].strip().lower()
+        grade = row[grade_col].strip().lower() if len(row) > grade_col else ""
 
-        if status.startswith("gameover"):
+        # Check both col K (status/ladder) and col M (grade) for triggers
+        if status.startswith("gameover") or "gameover" in grade.replace(" ", "").replace("-", ""):
             gameover_rows.append((list_idx, row))
-        elif status.startswith("ex-associate"):
+        elif status.startswith("ex-associate") or "ex-associate" in grade.replace(" ", "-"):
             ex_associate_rows.append((list_idx, row))
-        elif status.startswith("affiliate"):
+        elif status.startswith("affiliate") or "affiliate" in grade:
             affiliate_rows.append((list_idx, row))
 
     log.info(
