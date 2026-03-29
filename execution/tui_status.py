@@ -93,7 +93,8 @@ def log_run_msg(msg: str, level: str = "info"):
 
 
 def log_event(action: str, email: str, result: str,
-              slack: str = "", name: str = "", reason: str = ""):
+              slack: str = "", name: str = "", reason: str = "",
+              verify_group: bool = None, verify_slack: bool = None):
     """Record an onboarding/offboarding event in history."""
     data = _load_status()
     event = {
@@ -107,6 +108,10 @@ def log_event(action: str, email: str, result: str,
         event["name"] = name
     if reason:
         event["reason"] = reason
+    if verify_group is not None:
+        event["verify_group"] = verify_group
+    if verify_slack is not None:
+        event["verify_slack"] = verify_slack
 
     if action == "add":
         data["total_added"] = data.get("total_added", 0) + 1

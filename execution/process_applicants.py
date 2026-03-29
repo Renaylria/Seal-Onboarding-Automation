@@ -571,7 +571,8 @@ def _run_applicants(log, rl):
             if not gv2.ok:
                 log.error("  [Verify] FAIL — %s not confirmed in %s", email, active_group)
 
-            log_event("add", email, "APPROVED", name=name)
+            log_event("add", email, "APPROVED", name=name,
+                      verify_group=gv.ok and gv2.ok)
 
     if new_rejected:
         write_to_next_blank_row(sheets_svc, sid, rejected_tab,

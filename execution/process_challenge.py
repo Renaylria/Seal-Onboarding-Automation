@@ -1024,10 +1024,13 @@ def _run_challenge(log, rl):
             # Invite to Slack
             set_live("adding", "Inviting to Slack", email=email, step="slack")
             handle_slack(email, log)
+            sv_ok = None
             if SLACK_USER_TOKEN:
                 sv = verify_slack_active(email, SLACK_USER_TOKEN, "bearer")
+                sv_ok = sv.ok
                 log.info("  [Verify] Slack active: %s", sv.detail)
-            log_event("add", email, "STAGE3_ADDED")
+            log_event("add", email, "STAGE3_ADDED",
+                      verify_group=gv.ok, verify_slack=sv_ok)
             # Extract name from row for notes (column index 1 is typically the name)
             row_name = row[1].strip() if len(row) > 1 else ""
             rl.add_note(f"STAGE 3 → Associates: {row_name} ({email})")

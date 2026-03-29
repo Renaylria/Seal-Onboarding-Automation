@@ -47,7 +47,7 @@ load_dotenv()
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT        = Path(__file__).resolve().parent.parent
 CONFIG      = ROOT / "config.yaml"
-TOKEN_GMAIL = ROOT / "token_gmail.json"   # sealdirector@gmail.com — Sheets access
+TOKEN_GMAIL = ROOT / "token_gmail.json"   # sealscripting@gmail.com — Sheets access
 TOKEN_ADMIN = ROOT / "token_admin.json"   # admin@maxalton.com     — Group management
 CREDS       = ROOT / "credentials.json"
 TMP                    = ROOT / ".tmp"
@@ -823,7 +823,7 @@ def _run_clan_cleanup(log, rl):
 
     # ── Authenticate ──────────────────────────────────────────────────────────
     log.info("Authenticating (Sheets)…")
-    gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, "sealdirector@gmail.com")
+    gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, "sealscripting@gmail.com")
     sheets_svc  = build("sheets", "v4", http=AuthorizedHttp(gmail_creds, http=make_http()))
 
     log.info("Authenticating (Admin SDK)…")
@@ -969,6 +969,7 @@ def _run_clan_cleanup(log, rl):
                 remove_from_google_group(admin_svc, active_group_email, member_email, log)
                 gv = verify_group_not_member(admin_svc, active_group_email, member_email)
                 log.info("  [Verify] Group removal: %s", gv.detail)
+                sv_ok = None
                 if member_email.lower() in slack_skip_emails:
                     log.info("  [Slack] SKIPPING deactivation for %s (in slack_skip_emails)", member_email)
                 else:
@@ -976,8 +977,10 @@ def _run_clan_cleanup(log, rl):
                     handle_slack_deactivate(member_email, log)
                     if SLACK_USER_TOKEN:
                         sv = verify_slack_deactivated(member_email, SLACK_USER_TOKEN, "bearer")
+                        sv_ok = sv.ok
                         log.info("  [Verify] Slack deactivated: %s", sv.detail)
-                log_event("remove", member_email, "REMOVED", reason="GameOver flag")
+                log_event("remove", member_email, "REMOVED", reason="GameOver flag",
+                          verify_group=gv.ok, verify_slack=sv_ok)
                 rl.add_note(f"GAMEOVER → Ex-Communicado: {member_name} ({member_email})")
             else:
                 log.warning(
@@ -1003,6 +1006,7 @@ def _run_clan_cleanup(log, rl):
                 remove_from_google_group(admin_svc, active_group_email, member_email, log)
                 gv = verify_group_not_member(admin_svc, active_group_email, member_email)
                 log.info("  [Verify] Group removal: %s", gv.detail)
+                sv_ok = None
                 if member_email.lower() in slack_skip_emails:
                     log.info("  [Slack] SKIPPING deactivation for %s (in slack_skip_emails)", member_email)
                 else:
@@ -1010,8 +1014,10 @@ def _run_clan_cleanup(log, rl):
                     handle_slack_deactivate(member_email, log)
                     if SLACK_USER_TOKEN:
                         sv = verify_slack_deactivated(member_email, SLACK_USER_TOKEN, "bearer")
+                        sv_ok = sv.ok
                         log.info("  [Verify] Slack deactivated: %s", sv.detail)
-                log_event("remove", member_email, "REMOVED", reason="Ex-Associate")
+                log_event("remove", member_email, "REMOVED", reason="Ex-Associate",
+                          verify_group=gv.ok, verify_slack=sv_ok)
                 rl.add_note(f"EX-ASSOCIATE → Ex-Associate tab: {member_name} ({member_email})")
             else:
                 log.warning(
