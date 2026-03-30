@@ -11,14 +11,24 @@ the TUI in real time as they process applicants, challenges, and cleanup.
 
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
+
+# CSV audit logging (shared module in sudoku-blueprint)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sudoku-blueprint"))
+try:
+    from onboarding_csv import csv_log as _csv_log
+except ImportError:
+    def _csv_log(*a, **kw): pass  # fallback if module unavailable
 
 STATUS_PATH = Path(os.environ.get("HOME", "/tmp")) / "Projects" / "sudoku-blueprint" / "onboarding_status.json"
 LIVE_PATH   = Path(os.environ.get("HOME", "/tmp")) / "Projects" / "sudoku-blueprint" / "onboarding_live.json"
 
 MAX_HISTORY = 200
 MAX_RUN_LOG = 50
+
+_current_script = ""  # set by log_run_start
 
 
 def _load_status() -> dict:
@@ -66,6 +76,8 @@ def set_live(phase: str, detail: str = "", email: str = "", step: str = ""):
 
 def log_run_start(script_name: str):
     """Record that a script run has started."""
+    global _current_script
+    _current_script = script_name
     data = _load_status()
     data["total_runs"] = data.get("total_runs", 0) + 1
     data["last_run"] = datetime.now().isoformat()
@@ -123,9 +135,20 @@ def log_event(action: str, email: str, result: str,
     data["history"] = history[-MAX_HISTORY:]
     _save_status(data)
 
+    # Write to CSV audit log
+    _csv_log(
+        script=_current_script, run_number=data.get("total_runs", 0),
+        action=action, email=email, name=name,
+        step="onboard" if action == "add" else "offboard",
+        result=result, verify_group=verify_group, verify_slack=verify_slack,
+        reason=reason,
+    )
+
 
 def log_result(result: str):
     """Set the last_result field."""
     data = _load_status()
     data["last_result"] = result
     _save_status(data)
+    _csv_log(script=_current_script, run_number=data.get("total_runs", 0),
+             action="summary", result=result)
