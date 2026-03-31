@@ -60,6 +60,18 @@ if [ ! -f "$ROTATION_MARKER" ]; then
     touch "$ROTATION_MARKER"
 fi
 
+# ── PID overlap guard ────────────────────────────────────────────────
+PIDFILE="$DIR/.tmp/run_all.pid"
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "===== $(date) ===== run_all.sh SKIPPED (previous run PID $OLD_PID still alive) =====" >> "$DIR/.tmp/cron.log"
+        exit 0
+    fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+
 echo "===== $(date) ===== run_all.sh started =====" >> "$DIR/.tmp/cron.log"
 
 # Run order matters:
