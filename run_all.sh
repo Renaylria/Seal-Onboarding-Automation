@@ -52,7 +52,8 @@ ROTATION_MARKER="$DIR/.tmp/.rotated_$MONTH_TAG"
 if [ ! -f "$ROTATION_MARKER" ]; then
     for logfile in "$DIR/.tmp/cron.log" "$DIR/.tmp/process_applicants.log" \
                    "$DIR/.tmp/process_challenge.log" "$DIR/.tmp/process_clan_cleanup.log" \
-                   "$DIR/.tmp/process_slack_audit.log"; do
+                   "$DIR/.tmp/process_slack_audit.log" \
+                   "$DIR/.tmp/process_onboarding_cleanup.log"; do
         if [ -f "$logfile" ]; then
             mv "$logfile" "${logfile%.log}_$(date -v-1d +%Y-%m 2>/dev/null || date +%Y-%m).log.bak"
         fi
@@ -74,15 +75,28 @@ trap 'rm -f "$PIDFILE"' EXIT
 
 echo "===== $(date) ===== run_all.sh started =====" >> "$DIR/.tmp/cron.log"
 
-# Run order matters:
-#   1. clan_cleanup  — remove departing members from Associates first
-#   2. applicants    — process new applicants
-#   3. challenge     — promote stage 3 to Associates (dedup checks Associates,
-#                      so cleanup must run first to avoid false "already there")
-#   4. slack_audit   — audit Associates vs Slack (must run AFTER all three
-#                      above so that Associates is fully up-to-date)
+# ── Pre-flight: token health check ──────────────────────────────────
+TOKEN_CHECK=$(python3 token_health_check.py 2>&1)
+TOKEN_EXIT=$?
+echo "$TOKEN_CHECK" >> "$DIR/.tmp/cron.log"
+if [ $TOKEN_EXIT -ne 0 ]; then
+    echo "ABORTED: Token health check failed — skipping pipeline" >> "$DIR/.tmp/cron.log"
+    echo "===== $(date) ===== run_all.sh aborted (bad tokens) =====" >> "$DIR/.tmp/cron.log"
+    rm -f "$PIDFILE"
+    exit 1
+fi
 
-for script in process_clan_cleanup.py process_applicants.py process_challenge.py process_slack_audit.py; do
+# Run order matters:
+#   1. clan_cleanup          — remove departing members from Associates first
+#   2. applicants            — process new applicants
+#   3. challenge             — promote stage 3 to Associates (dedup checks Associates,
+#                              so cleanup must run first to avoid false "already there")
+#   4. slack_audit           — audit Associates vs Slack (must run AFTER all three
+#                              above so that Associates is fully up-to-date)
+#   5. onboarding_cleanup   — remove departed members from onboarding Google Group
+#                              (must run AFTER clan_cleanup populates AAD tabs)
+
+for script in process_clan_cleanup.py process_applicants.py process_challenge.py process_slack_audit.py process_onboarding_cleanup.py; do
     OUTPUT=$(run_with_timeout "$script" 2>&1)
     EXIT_CODE=$?
     echo "$OUTPUT" >> "$DIR/.tmp/cron.log"

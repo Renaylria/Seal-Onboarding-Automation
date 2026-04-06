@@ -36,6 +36,7 @@ from google_auth_httplib2 import AuthorizedHttp
 from proxy_http import make_http
 from tui_status import set_live, log_run_start, log_run_msg, log_event, log_result
 from run_logger import RunLogger
+from sheets_retry import retry_execute
 from playwright.sync_api import sync_playwright
 
 # Ground-truth verification (shared module in sudoku-blueprint)
@@ -135,11 +136,10 @@ def get_sheet_data(svc, spreadsheet_id: str, tab: str) -> list[list]:
     Returns:
         A list of rows; each row is a list of cell values (strings).
     """
-    result = (
+    result = retry_execute(
         svc.spreadsheets()
         .values()
         .get(spreadsheetId=spreadsheet_id, range=tab)
-        .execute()
     )
     return result.get("values", [])
 
@@ -152,13 +152,13 @@ def ensure_tab_exists(svc, spreadsheet_id: str, tab: str) -> None:
         spreadsheet_id: The spreadsheet ID string.
         tab:            The tab name to ensure exists.
     """
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = retry_execute(svc.spreadsheets().get(spreadsheetId=spreadsheet_id))
     existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
     if tab in existing:
         return
 
     body = {"requests": [{"addSheet": {"properties": {"title": tab}}}]}
-    svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
+    retry_execute(svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body))
 
 
 def _find_next_blank_row(
@@ -166,11 +166,10 @@ def _find_next_blank_row(
 ) -> int:
     """Return the 1-indexed first blank row in column A at or below start_row."""
     col_a_range = f"'{tab}'!A:A"
-    result = (
+    result = retry_execute(
         svc.spreadsheets()
         .values()
         .get(spreadsheetId=spreadsheet_id, range=col_a_range)
-        .execute()
     )
     col_a: list[list] = result.get("values", [])
     for row_idx in range(start_row - 1, len(col_a)):
@@ -203,12 +202,12 @@ def write_rows_with_formatting(
     next_row = _find_next_blank_row(svc, dst_spreadsheet_id, dst_tab, start_row)
 
     # ── Read source rows with full cell data ──────────────────────────────
-    src_result = svc.spreadsheets().get(
+    src_result = retry_execute(svc.spreadsheets().get(
         spreadsheetId=src_spreadsheet_id,
         ranges=[f"'{src_tab}'"],
         includeGridData=True,
         fields="sheets.data.rowData,sheets.properties.title"
-    ).execute()
+    ))
 
     all_row_data = []
     for sheet in src_result.get("sheets", []):
@@ -222,7 +221,7 @@ def write_rows_with_formatting(
         rows_to_write.append(rd)
 
     # ── Get destination sheet metadata ────────────────────────────────────
-    dst_meta = svc.spreadsheets().get(spreadsheetId=dst_spreadsheet_id).execute()
+    dst_meta = retry_execute(svc.spreadsheets().get(spreadsheetId=dst_spreadsheet_id))
     dst_sheet_id = None
     dst_col_count = None
     dst_row_count = None
@@ -238,14 +237,14 @@ def write_rows_with_formatting(
     # ── Expand grid if needed ─────────────────────────────────────────────
     needed = next_row + len(rows_to_write) - 1
     if needed > dst_row_count:
-        svc.spreadsheets().batchUpdate(
+        retry_execute(svc.spreadsheets().batchUpdate(
             spreadsheetId=dst_spreadsheet_id,
             body={"requests": [{"appendDimension": {
                 "sheetId": dst_sheet_id,
                 "dimension": "ROWS",
                 "length": needed - dst_row_count + 50
             }}]}
-        ).execute()
+        ))
         log.info("  Expanded '%s' grid to %d rows", dst_tab, needed + 50)
 
     # ── Trim rows to destination column count ─────────────────────────────
@@ -267,17 +266,17 @@ def write_rows_with_formatting(
         }
         for i, rd in enumerate(rows_to_write)
     ]
-    svc.spreadsheets().batchUpdate(
+    retry_execute(svc.spreadsheets().batchUpdate(
         spreadsheetId=dst_spreadsheet_id,
         body={"requests": requests_body}
-    ).execute()
+    ))
     log.info("  Wrote %d row(s) with formatting to '%s'!A%d", len(rows_to_write), dst_tab, next_row)
 
     # ── Verify write ──────────────────────────────────────────────────────
-    verify = svc.spreadsheets().values().get(
+    verify = retry_execute(svc.spreadsheets().values().get(
         spreadsheetId=dst_spreadsheet_id,
         range=f"'{dst_tab}'!A{next_row}:A{next_row + len(rows_to_write) - 1}"
-    ).execute()
+    ))
     written = verify.get("values", [])
     if len(written) != len(rows_to_write):
         log.error(
@@ -305,7 +304,7 @@ def get_sheet_id(svc, spreadsheet_id: str, tab: str) -> int:
     Raises:
         ValueError: If the tab is not found in the spreadsheet.
     """
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = retry_execute(svc.spreadsheets().get(spreadsheetId=spreadsheet_id))
     for sheet in meta.get("sheets", []):
         if sheet["properties"]["title"] == tab:
             return sheet["properties"]["sheetId"]
@@ -354,10 +353,10 @@ def delete_rows(
         for idx in sorted(row_indices, reverse=True)
     ]
     try:
-        svc.spreadsheets().batchUpdate(
+        retry_execute(svc.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": requests_body},
-        ).execute()
+        ))
         log.info(
             "  Deleted %d row(s) from '%s' (indices: %s)",
             len(row_indices), tab, sorted(row_indices, reverse=True),
@@ -390,9 +389,9 @@ def remove_from_google_group(
         log:          Logger instance for status messages.
     """
     try:
-        admin_svc.members().delete(
+        retry_execute(admin_svc.members().delete(
             groupKey=group_email, memberKey=member_email
-        ).execute()
+        ))
         log.info("  Removed %s from group %s", member_email, group_email)
     except HttpError as exc:
         if exc.resp.status == 404:
@@ -941,10 +940,10 @@ def _run_clan_cleanup(log, rl):
         )
         # Verification is done inside write_rows_with_formatting.
         # Double-check by reading back column A at the write location.
-        verify = sheets_svc.spreadsheets().values().get(
+        verify = retry_execute(sheets_svc.spreadsheets().values().get(
             spreadsheetId=dst_sid,
             range=f"'{dst_tab}'!A{wrote_row}:A{wrote_row + len(src_indices) - 1}"
-        ).execute()
+        ))
         written = verify.get("values", [])
         if len(written) != len(src_indices):
             log.error(

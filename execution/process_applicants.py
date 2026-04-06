@@ -39,6 +39,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from sheets_retry import retry_execute
 from google_auth_httplib2 import AuthorizedHttp
 from proxy_http import make_http
 from tui_status import set_live, log_run_start, log_run_msg, log_event, log_result
@@ -100,29 +101,29 @@ def get_credentials(scopes: list, token_path: Path, hint: str = "") -> Credentia
 
 def get_sheet_data(svc, spreadsheet_id: str, tab: str) -> list:
     """Return all rows from a tab as a list of lists."""
-    result = svc.spreadsheets().values().get(
+    result = retry_execute(svc.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"'{tab}'"
-    ).execute()
+    ))
     return result.get("values", [])
 
 
 def ensure_tab_exists(svc, spreadsheet_id: str, tab: str, header: list | None = None):
     """Create a tab if it doesn't already exist, optionally writing a header row."""
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = retry_execute(svc.spreadsheets().get(spreadsheetId=spreadsheet_id))
     existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
     if tab not in existing:
-        svc.spreadsheets().batchUpdate(
+        retry_execute(svc.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}
-        ).execute()
+        ))
         if header:
-            svc.spreadsheets().values().update(
+            retry_execute(svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=f"'{tab}'!A1",
                 valueInputOption="USER_ENTERED",
                 body={"values": [header]}
-            ).execute()
+            ))
 
 
 def write_to_next_blank_row(svc, spreadsheet_id: str, tab: str, rows: list,
@@ -135,10 +136,10 @@ def write_to_next_blank_row(svc, spreadsheet_id: str, tab: str, rows: list,
 
     Returns the 1-indexed row number where writing began.
     """
-    result = svc.spreadsheets().values().get(
+    result = retry_execute(svc.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"'{tab}'!A:A"
-    ).execute()
+    ))
     col_a = result.get("values", [])
 
     next_row = start_row  # default: use start_row if everything is blank
@@ -150,19 +151,19 @@ def write_to_next_blank_row(svc, spreadsheet_id: str, tab: str, rows: list,
         # All rows from start_row downward have data — write after last
         next_row = max(len(col_a) + 1, start_row)
 
-    svc.spreadsheets().values().update(
+    retry_execute(svc.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=f"'{tab}'!A{next_row}",
         valueInputOption="USER_ENTERED",
         body={"values": rows}
-    ).execute()
+    ))
     log.info(f"  [Sheets] Wrote {len(rows)} row(s) to '{tab}' starting at row {next_row}")
 
     # ── Verify write ──────────────────────────────────────────────────────
-    verify = svc.spreadsheets().values().get(
+    verify = retry_execute(svc.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"'{tab}'!A{next_row}:A{next_row + len(rows) - 1}"
-    ).execute()
+    ))
     written = verify.get("values", [])
     if len(written) != len(rows):
         log.error(
@@ -189,6 +190,26 @@ def get_emails_in_tab(svc, spreadsheet_id: str, tab: str, email_col: int) -> set
         return set()
 
 
+def get_dedup_keys_in_tab(svc, spreadsheet_id: str, tab: str,
+                          email_col: int, date_col: int = 0) -> set:
+    """Return set of (lowercase_email, date_string) tuples for deduplication.
+
+    Uses (email, date) composite keys so that the same person can be
+    re-processed if they reapply on a different date (e.g. returning members).
+    """
+    try:
+        data = get_sheet_data(svc, spreadsheet_id, tab)
+        result = set()
+        for row in data[1:]:  # skip header
+            if len(row) > email_col and row[email_col].strip():
+                email = row[email_col].strip().lower()
+                date_val = row[date_col].strip() if len(row) > date_col else ""
+                result.add((email, date_val))
+        return result
+    except HttpError:
+        return set()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Classification
 # ══════════════════════════════════════════════════════════════════════════════
@@ -206,10 +227,10 @@ def is_rejected(status: str, keywords: list) -> bool:
 def add_to_google_group(admin_svc, group_email: str, member_email: str, log):
     """Add member_email to a Workspace Google Group via Admin SDK Directory API."""
     try:
-        admin_svc.members().insert(
+        retry_execute(admin_svc.members().insert(
             groupKey=group_email,
             body={"email": member_email, "role": "MEMBER"}
-        ).execute()
+        ))
         log.info(f"  [Group] Added: {member_email}")
     except HttpError as e:
         if e.resp.status == 409:
@@ -342,19 +363,19 @@ def batch_mark_emails_sent(svc, spreadsheet_id: str,
         for tab, row_number in marks
     ]
     try:
-        svc.spreadsheets().values().batchUpdate(
+        retry_execute(svc.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"valueInputOption": "USER_ENTERED", "data": data}
-        ).execute()
+        ))
         log.info(f"  [Sheets] Marked {len(marks)} row(s) as email sent in column {col_letter}")
 
         # ── Verify marks were written ─────────────────────────────────────
         failed_verifications = []
         for tab, row_number in marks:
             cell = f"'{tab}'!{col_letter}{row_number}"
-            verify = svc.spreadsheets().values().get(
+            verify = retry_execute(svc.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id, range=cell
-            ).execute()
+            ))
             val = verify.get("values", [[""]])[0][0] if verify.get("values") else ""
             if not val.startswith("Sent"):
                 failed_verifications.append(cell)
@@ -480,12 +501,14 @@ def _run_applicants(log, rl):
     header    = all_rows[0]
     data_rows = all_rows[1:]
 
-    # Collect already-processed emails (deduplication)
+    # Collect already-processed (email, date) pairs for deduplication.
+    # Uses composite keys so returning members (same email, new application
+    # date) are processed again instead of being permanently skipped.
     processed = (
-        get_emails_in_tab(sheets_svc, sid, approved_tab, email_col)
-        | get_emails_in_tab(sheets_svc, sid, rejected_tab, email_col)
+        get_dedup_keys_in_tab(sheets_svc, sid, approved_tab, email_col)
+        | get_dedup_keys_in_tab(sheets_svc, sid, rejected_tab, email_col)
     )
-    log.info(f"Previously processed emails: {len(processed)}")
+    log.info(f"Previously processed (email, date) pairs: {len(processed)}")
 
     # Ensure destination tabs exist (creates them with header if missing)
     ensure_tab_exists(sheets_svc, sid, approved_tab, header)
@@ -510,12 +533,14 @@ def _run_applicants(log, rl):
         if not EMAIL_RE.match(email):
             log.debug(f"Skipping non-email value in column B: '{email}'")
             continue                              # skip header artifacts / annotation rows
-        if email.lower() in processed:
+        date_val = padded[0].strip()              # column A — application date
+        dedup_key = (email.lower(), date_val)
+        if dedup_key in processed:
             continue                              # already handled in a prior run
-        if email.lower() in seen_this_run:
+        if dedup_key in seen_this_run:
             log.warning(f"Duplicate in source sheet, skipping second occurrence: {email}")
             continue                              # duplicate row in current sheet
-        seen_this_run.add(email.lower())
+        seen_this_run.add(dedup_key)
 
         status = padded[status_col].strip()
         name   = padded[name_col].strip() if len(padded) > name_col else ""

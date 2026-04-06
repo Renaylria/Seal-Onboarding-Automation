@@ -30,6 +30,7 @@ from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from sheets_retry import retry_execute
 
 import yaml
 
@@ -151,7 +152,11 @@ class RunLogger:
         return self._sheets
 
     def _write_run_log(self, duration: float):
-        """Append a row to the Run Log tab."""
+        """Append a row to the Run Log tab. Skips logging if no actions and no errors."""
+        if not self.actions and not self.errors:
+            self.log.info("  [RunLogger] No actions or errors — skipping Run Log entry")
+            return
+
         if not self._sheet_id:
             self.log.warning("  [RunLogger] No automation_log.sheet_id in config — skipping Sheets log")
             return
@@ -173,19 +178,19 @@ class RunLogger:
         ]
 
         try:
-            result = svc.spreadsheets().values().append(
+            result = retry_execute(svc.spreadsheets().values().append(
                 spreadsheetId=self._sheet_id,
                 range="'Run Log'!A:H",
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": [row]},
-            ).execute()
+            ))
             # Verify by reading back the updated range
             updated_range = result.get("updates", {}).get("updatedRange", "")
             if updated_range:
-                verify = svc.spreadsheets().values().get(
+                verify = retry_execute(svc.spreadsheets().values().get(
                     spreadsheetId=self._sheet_id, range=updated_range
-                ).execute()
+                ))
                 if not verify.get("values"):
                     self.log.warning("  [RunLogger] Run Log write could not be verified")
         except Exception as e:
@@ -214,19 +219,19 @@ class RunLogger:
             ])
 
         try:
-            result = svc.spreadsheets().values().append(
+            result = retry_execute(svc.spreadsheets().values().append(
                 spreadsheetId=self._sheet_id,
                 range="'Error Log'!A:H",
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": rows},
-            ).execute()
+            ))
             # Verify by reading back
             updated_range = result.get("updates", {}).get("updatedRange", "")
             if updated_range:
-                verify = svc.spreadsheets().values().get(
+                verify = retry_execute(svc.spreadsheets().values().get(
                     spreadsheetId=self._sheet_id, range=updated_range
-                ).execute()
+                ))
                 if not verify.get("values"):
                     self.log.warning("  [RunLogger] Error Log write could not be verified")
         except Exception as e:

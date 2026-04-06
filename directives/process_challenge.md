@@ -32,7 +32,7 @@ Run hourly via Windows Task Scheduler alongside `process_applicants.py`.
 
 ## Authentication
 Reuses the same token files as `process_applicants.py`:
-- `token_gmail.json` — sealdirector@gmail.com (Sheets read/write)
+- `token_gmail.json` — sealscripting@gmail.com (Sheets read/write)
 - `token_admin.json` — admin@maxalton.com (Admin SDK group management)
 
 No additional OAuth setup needed.

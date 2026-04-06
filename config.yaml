@@ -147,8 +147,17 @@ clan_cleanup:
   slack_skip_emails:
     - "ashama@uw.edu"
 
+# ── Onboarding Group Cleanup ──────────────────────────────────────────────
+# Removes departed members (Ex-Communicado / Ex-Associate in AAD) from the
+# onboarding Google Group, unless they still appear in SEAL Clan Life Associates.
+# Reuses clan_cleanup sheet IDs and tab names for AAD / Clan Life lookups.
+onboarding_cleanup:
+  email_column_index: 41       # Column AP — email in both AAD and Clan Life
+  start_row: 14                # Rows 1-13 are header/sample rows
+  onboarding_group_email: "onboarding@maxalton.com"
+
 # ── Automation Log ──────────────────────────────────────────────────────────
 # Google Sheet used by run_logger.py to track all script runs and errors.
-# Owned by sealdirector@gmail.com.
+# Owned by sealscripting@gmail.com.
 automation_log:
   sheet_id: "1KS6JXbZVw3sSOQV17iNTtWdALLLueWJIHWeA5jCdX7Y"

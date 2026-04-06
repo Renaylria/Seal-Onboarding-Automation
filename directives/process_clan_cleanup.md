@@ -135,7 +135,7 @@ python execution/process_clan_cleanup.py
 Logs are written to `.tmp/process_clan_cleanup.log` and mirrored to stdout.
 
 On first run, two browser windows will open for OAuth consent:
-1. `sealdirector@gmail.com` — Sheets read/write access
+1. `sealscripting@gmail.com` — Sheets read/write access
 2. `admin@maxalton.com` — Admin SDK group membership access
 
 Tokens are cached in `token_gmail.json` and `token_admin.json` at the project
