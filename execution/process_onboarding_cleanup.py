@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -49,7 +50,7 @@ LOG_FILE    = TMP / "process_onboarding_cleanup.log"
 PROCESSED_FILE = ROOT / "onboarding_cleanup_processed.json"
 
 # ── OAuth Scopes ───────────────────────────────────────────────────────────────
-SCOPES_GMAIL = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SCOPES_GMAIL = ["https://www.googleapis.com/auth/spreadsheets"]
 SCOPES_ADMIN = ["https://www.googleapis.com/auth/admin.directory.group.member"]
 
 
@@ -182,6 +183,122 @@ def remove_from_google_group(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Applicant Challenge stale-row cleanup
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Google Sheets serial-date epoch: 1899-12-30 is serial 0.
+_SHEETS_EPOCH_ORDINAL = date(1899, 12, 30).toordinal()
+
+
+def _get_applicants_sheet_id(svc, spreadsheet_id: str, tab_name: str) -> int:
+    """Resolve the numeric sheetId for *tab_name* (required for deleteDimension)."""
+    meta = retry_execute(svc.spreadsheets().get(spreadsheetId=spreadsheet_id))
+    for s in meta.get("sheets", []):
+        props = s.get("properties", {})
+        if props.get("title") == tab_name:
+            return props["sheetId"]
+    raise RuntimeError(f"Tab '{tab_name}' not found in spreadsheet {spreadsheet_id}")
+
+
+def cleanup_stale_applicants(sheets_svc, cfg: dict, log: logging.Logger, rl) -> None:
+    """Delete rows from the Applicants tab whose Check-In Date (col F) is stale.
+
+    A row is deleted when:
+      - its nickname (col A) or full-name (col B) column is non-empty, AND
+      - its check-in-date cell is blank OR more than max_age_days old.
+
+    Rows with no name content are treated as empty template rows and skipped.
+    """
+    spreadsheet_id = cfg["applicant_challenge_sheet_id"]
+    tab            = cfg["applicants_tab"]
+    checkin_col    = cfg["checkin_column_index"]      # 5 (F)
+    nick_col       = cfg["nickname_column_index"]     # 0 (A)
+    name_col       = cfg["fullname_column_index"]     # 1 (B)
+    start_row      = cfg["start_row"]                 # 10 (1-indexed)
+    max_age_days   = cfg["max_age_days"]              # 7
+
+    log.info("Scanning Applicant Challenge 'Applicants' tab for stale rows…")
+
+    sheet_id = _get_applicants_sheet_id(sheets_svc, spreadsheet_id, tab)
+
+    # Read with UNFORMATTED_VALUE so dates come back as Sheets serial numbers.
+    result = retry_execute(
+        sheets_svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=tab,
+            valueRenderOption="UNFORMATTED_VALUE",
+        )
+    )
+    rows = result.get("values", [])
+
+    today_serial = date.today().toordinal() - _SHEETS_EPOCH_ORDINAL
+    data_start_idx = start_row - 1  # 0-based
+
+    # Collect (row_index_0based, reason, label) for rows to delete.
+    to_delete: list[tuple[int, str, str]] = []
+    for idx, row in enumerate(rows):
+        if idx < data_start_idx:
+            continue
+
+        nickname = (row[nick_col].strip() if len(row) > nick_col and isinstance(row[nick_col], str) else
+                    (str(row[nick_col]).strip() if len(row) > nick_col else ""))
+        fullname = (row[name_col].strip() if len(row) > name_col and isinstance(row[name_col], str) else
+                    (str(row[name_col]).strip() if len(row) > name_col else ""))
+        if not nickname and not fullname:
+            continue  # empty template row — leave alone
+
+        label = nickname or fullname
+
+        checkin_val = row[checkin_col] if len(row) > checkin_col else ""
+        if checkin_val == "" or checkin_val is None:
+            to_delete.append((idx, "blank check-in date", label))
+            continue
+
+        if isinstance(checkin_val, (int, float)):
+            age_days = today_serial - int(checkin_val)
+            if age_days > max_age_days:
+                to_delete.append((idx, f"{age_days} days old", label))
+        else:
+            # Non-numeric, non-empty (e.g. stray text) — leave it alone, surface warning.
+            log.warning("  Row %d has non-numeric check-in value %r — skipping", idx + 1, checkin_val)
+
+    if not to_delete:
+        log.info("No stale applicant rows found.")
+        rl.add_note("Applicant cleanup: 0 rows removed")
+        return
+
+    log.info("Found %d stale applicant row(s) to delete:", len(to_delete))
+    for idx, reason, label in to_delete:
+        log.info("  Row %d — %s (%s)", idx + 1, label, reason)
+
+    # Build deleteDimension requests bottom-up so indices stay valid.
+    requests = []
+    for idx, _reason, _label in sorted(to_delete, key=lambda t: t[0], reverse=True):
+        requests.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": idx,
+                    "endIndex": idx + 1,
+                }
+            }
+        })
+
+    retry_execute(
+        sheets_svc.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        )
+    )
+
+    log.info("Deleted %d stale applicant row(s)", len(to_delete))
+    rl.add_action(f"{len(to_delete)} stale applicant row(s) deleted")
+    for _idx, reason, label in to_delete:
+        log_event("remove", label, "REMOVED", reason=f"Applicant cleanup: {reason}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -220,7 +337,7 @@ def _run_onboarding_cleanup(log, rl):
     onboarding_group   = cfg["onboarding_group_email"]   # onboarding@maxalton.com
 
     # ── Authenticate ──────────────────────────────────────────────────────────
-    log.info("Authenticating (Sheets — read-only)…")
+    log.info("Authenticating (Sheets)…")
     gmail_creds = get_credentials(SCOPES_GMAIL, TOKEN_GMAIL, "sealscripting@gmail.com")
     sheets_svc  = build("sheets", "v4", http=AuthorizedHttp(gmail_creds, http=make_http()))
 
@@ -252,6 +369,18 @@ def _run_onboarding_cleanup(log, rl):
         log_run_msg("Onboarding cleanup: no new emails")
         log_result("empty")
         rl.set_rows_processed("0 new")
+
+        # Still run applicant-challenge cleanup even if no new departed emails.
+        try:
+            applicant_cfg = cfg_root.get("applicant_challenge_cleanup")
+            if applicant_cfg:
+                set_live("checking", "Scanning Applicant Challenge for stale rows")
+                cleanup_stale_applicants(sheets_svc, applicant_cfg, log, rl)
+        except Exception as exc:
+            import traceback as tb
+            log.error("Applicant cleanup failed: %s\n%s", exc, tb.format_exc())
+            rl.log_error("APPLICANT_CLEANUP_001", f"Applicant cleanup failed: {exc}")
+
         set_live("idle", "Onboarding cleanup complete — nothing to do")
         log.info("=== Onboarding Cleanup complete ===")
         return
@@ -315,6 +444,20 @@ def _run_onboarding_cleanup(log, rl):
     rl.set_rows_processed(f"{len(new_emails)} new ({summary})")
     log_run_msg(f"Onboarding cleanup: {summary}")
     log_result("processed")
+
+    # ── Step 6: Applicant Challenge stale-row cleanup ─────────────────────────
+    set_live("checking", "Scanning Applicant Challenge for stale rows")
+    try:
+        applicant_cfg = cfg_root.get("applicant_challenge_cleanup")
+        if applicant_cfg:
+            cleanup_stale_applicants(sheets_svc, applicant_cfg, log, rl)
+        else:
+            log.info("applicant_challenge_cleanup not configured — skipping")
+    except Exception as exc:
+        import traceback as tb
+        log.error("Applicant cleanup failed: %s\n%s", exc, tb.format_exc())
+        rl.log_error("APPLICANT_CLEANUP_001", f"Applicant cleanup failed: {exc}")
+
     set_live("idle", "Onboarding cleanup complete")
     log.info("=== Onboarding Cleanup complete ===")
 

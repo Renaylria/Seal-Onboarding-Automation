@@ -156,6 +156,20 @@ onboarding_cleanup:
   start_row: 14                # Rows 1-13 are header/sample rows
   onboarding_group_email: "onboarding@maxalton.com"
 
+# ── Applicant Challenge Stale-Row Cleanup ──────────────────────────────────
+# Runs at the end of process_onboarding_cleanup.py. Deletes rows from the
+# Applicants tab of SEAL Applicant Challenge when the Check-In Date in
+# column F is more than max_age_days old, or is blank on a row that
+# otherwise has applicant name content in col A or B.
+applicant_challenge_cleanup:
+  applicant_challenge_sheet_id: "1tVHLoybyghVJo5w93UmeG5dBSpHqMSeq7ce1t7hnBYo"
+  applicants_tab: "Applicants"
+  checkin_column_index: 5      # Column F — Check-In Date (m/d, stored as serial)
+  nickname_column_index: 0     # Column A — nickname
+  fullname_column_index: 1     # Column B — full name
+  start_row: 10                # First real applicant row (rows 1-9 are headers/samples)
+  max_age_days: 7              # Delete if (today - checkin) > max_age_days
+
 # ── Automation Log ──────────────────────────────────────────────────────────
 # Google Sheet used by run_logger.py to track all script runs and errors.
 # Owned by sealscripting@gmail.com.

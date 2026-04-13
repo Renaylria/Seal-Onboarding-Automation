@@ -44,6 +44,30 @@ success — the member was already removed.
 Mark all successfully processed emails (removed + exceptions) in the tracking
 file.  Failed removals are **not** marked — they will be retried on the next run.
 
+### Step 6: Applicant Challenge stale-row cleanup
+Scan the **Applicants** tab of SEAL Applicant Challenge
+(`1tVHLoybyghVJo5w93UmeG5dBSpHqMSeq7ce1t7hnBYo`) starting at `start_row` (row
+10) and delete any row where:
+
+- column A (nickname) or column B (full name) is non-empty (i.e. it's a real
+  applicant row, not an empty template row), AND
+- column F (Check-In Date) is blank, OR more than `max_age_days` (7) old.
+
+Column F is displayed as `m/d` but stored as a Google Sheets serial number
+(days since 1899-12-30). Values are read with `UNFORMATTED_VALUE` so the
+script can compute age arithmetically: `age_days = today_serial - f_serial`,
+delete when `age_days > 7`. Exactly 7 days old is kept.
+
+Rows where both A and B are blank are treated as empty template rows and
+left alone — this protects the pre-filled template rows at the bottom of the
+tab as well as the header block above row 10.
+
+Deletes are batched into a single `batchUpdate` call with `deleteDimension`
+requests sorted bottom-up so row indices remain valid during the batch.
+
+Failures in this step are logged but do not fail the whole script (the group
+cleanup steps above are the primary responsibility of this script).
+
 ---
 
 ## Tracking File
@@ -72,8 +96,11 @@ keeping API calls minimal as the tabs grow.
 
 ## Sheets Access
 
-This script uses **read-only** Sheets scope (`spreadsheets.readonly`).  It never
-writes to, creates tabs in, or deletes rows from any Google Sheet.
+This script uses **read/write** Sheets scope (`spreadsheets`). The Google Group
+cleanup steps are read-only, but the Applicant Challenge stale-row cleanup
+(Step 6) deletes rows from the Applicants tab via `batchUpdate` →
+`deleteDimension`. It reuses `token_gmail.json`, which already has write scope
+from `process_challenge.py`.
 
 ---
 
@@ -114,6 +141,17 @@ sheet IDs / tab names are reused from the `clan_cleanup` key.
 | `email_column_index` | 0-based column index for email (AP = 41) |
 | `start_row` | First data row (1-indexed); rows above are skipped |
 | `onboarding_group_email` | Google Group to remove members from |
+
+Applicant Challenge cleanup parameters live under `applicant_challenge_cleanup`:
+
+| Key | Purpose |
+|---|---|
+| `applicant_challenge_sheet_id` | SEAL Applicant Challenge spreadsheet ID |
+| `applicants_tab` | Tab name — `Applicants` |
+| `checkin_column_index` | 0-based col index for Check-In Date (F = 5) |
+| `nickname_column_index` / `fullname_column_index` | 0-based indices used to detect "real applicant" rows (A = 0, B = 1) |
+| `start_row` | First data row (1-indexed); 10 for this tab |
+| `max_age_days` | Rows older than this are deleted (7) |
 
 ---
 
